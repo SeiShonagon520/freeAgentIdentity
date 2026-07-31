@@ -1,17 +1,57 @@
 services:
   app:
     build: .
+    depends_on:
+      - mihomo
     ports:
       - "8000:8000"   # FastAPI / Web UI
-      - "6080:6080"   # noVNC (headed 浏览器预览)
-      - "8889:8889"   # Turnstile Solver
+      - "127.0.0.1:6080:6080"   # noVNC (SSH tunnel only)
+      - "127.0.0.1:8889:8889"   # Turnstile Solver (host-local only)
     environment:
       - DISPLAY=:99
       - ACCOUNT_MANAGER_DATABASE_URL=sqlite:////app/data/account_manager.db
+      - APP_PASSWORD=${APP_PASSWORD:-}
+      - MIHOMO_CONTROLLER_URL=http://mihomo:9090
+      - MIHOMO_PROXY_URL=http://mihomo:7890
+      - MIHOMO_PROXY_GROUP=REGISTER-US
+      - CHATGPT_SENTINEL_VM_WORKERS=${CHATGPT_SENTINEL_VM_WORKERS:-3}
+      - CHATGPT_SENTINEL_TIMEZONE=${CHATGPT_SENTINEL_TIMEZONE:-America/New_York}
+      # Profile-aware: the V8 sandbox will receive language/cores/screen
+      # from the Python ProtocolEnvironmentProfile, so these defaults are
+      # fallbacks only.  Keep them consistent with desktop-us-en-chrome-v1.
+      - SENTINEL_LANGUAGE=${SENTINEL_LANGUAGE:-en-US}
+      - SENTINEL_LANGUAGES=${SENTINEL_LANGUAGES:-en-US,en}
+      - SENTINEL_CORES=${SENTINEL_CORES:-8}
+      - SENTINEL_SCREEN_WIDTH=${SENTINEL_SCREEN_WIDTH:-1920}
+      - SENTINEL_SCREEN_HEIGHT=${SENTINEL_SCREEN_HEIGHT:-1080}
+      - SENTINEL_SDK_AUTO_UPDATE=${SENTINEL_SDK_AUTO_UPDATE:-1}
+      - SENTINEL_SDK_REFRESH_SECONDS=${SENTINEL_SDK_REFRESH_SECONDS:-3600}
+      - SENTINEL_SDK_CACHE_DIR=/app/data/sentinel-sdk
       # 可选：设置访问密码，不设置则无密码保护
       # - APP_PASSWORD=changeme
       # 可选：设置 VNC 密码
       # - VNC_PASSWORD=changeme
     volumes:
       - ./data:/app/data   # 持久化 SQLite 数据库
+    networks:
+      - default
+      - inbucket
     restart: unless-stopped
+
+  mihomo:
+    image: metacubex/mihomo:latest
+    expose:
+      - "7890"
+      - "9090"
+    volumes:
+      - ${MIHOMO_CONFIG_PATH:-./deploy/mihomo/config.yaml}:/root/.config/mihomo/config.yaml:ro
+      - mihomo-provider-data:/root/.config/mihomo/providers
+    restart: unless-stopped
+
+volumes:
+  mihomo-provider-data:
+
+networks:
+  inbucket:
+    external: true
+    name: inbucket_default

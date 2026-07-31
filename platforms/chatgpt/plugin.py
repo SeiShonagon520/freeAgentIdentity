@@ -2,9 +2,15 @@
 import secrets
 from core.base_platform import BasePlatform, Account, AccountStatus, RegisterConfig
 from core.base_mailbox import BaseMailbox
-from core.registration import BrowserRegistrationAdapter, OtpSpec, ProtocolMailboxAdapter, RegistrationResult
+from core.registration import OtpSpec, ProtocolMailboxAdapter, RegistrationResult
 from core.registry import register
 from core.proxy_pool import proxy_pool
+from .environment_profile import FingerprintPool, ProtocolEnvironmentProfile
+
+# Shared fingerprint pool — each concurrent registration worker draws
+# the next profile round-robin so no two workers present identical
+# environment fingerprints at the same time.
+_fingerprint_pool = FingerprintPool.from_us_en_desktop()
 
 
 def _generate_chatgpt_registration_password(length: int = 16) -> str:
@@ -33,7 +39,7 @@ class ChatGPTPlatform(BasePlatform):
     name = "chatgpt"
     display_name = "ChatGPT"
     version = "1.0.0"
-    supported_executors = ["protocol", "headless", "headed"]
+    supported_executors = ["protocol"]
     supported_identity_modes = ["mailbox"]
     supported_oauth_providers = []
 
@@ -141,6 +147,7 @@ class ChatGPTPlatform(BasePlatform):
                 "access_token": result.get("access_token", ""),
                 "refresh_token": result.get("refresh_token", ""),
                 "id_token": result.get("id_token", ""),
+                "client_id": result.get("client_id", ""),
                 "session_token": result.get("session_token", ""),
                 "workspace_id": result.get("workspace_id", ""),
                 "cookies": result.get("cookies", ""),
@@ -149,37 +156,22 @@ class ChatGPTPlatform(BasePlatform):
             },
         )
 
-    def build_browser_registration_adapter(self):
-        def _build_browser_worker(ctx, artifacts):
-            from platforms.chatgpt.browser_register import ChatGPTBrowserRegister
-
-            return ChatGPTBrowserRegister(
-                headless=(ctx.executor_type == "headless"),
-                proxy=ctx.proxy,
-                otp_callback=artifacts.otp_callback,
-                log_fn=ctx.log,
-                backend_config=(ctx.extra or {}).get("_reuse_backend_config"),
-            )
-
-        return BrowserRegistrationAdapter(
-            result_mapper=lambda ctx, result: self._map_chatgpt_result(result),
-            browser_worker_builder=_build_browser_worker,
-            browser_register_runner=lambda worker, ctx, artifacts: worker.run(
-                email=ctx.identity.email or "",
-                password=ctx.password or "",
-            ),
-            otp_spec=OtpSpec(wait_message="等待验证码...", timeout=600),
-        )
-
     def build_protocol_mailbox_adapter(self):
         def _build_protocol_worker(ctx, artifacts):
             from platforms.chatgpt.protocol_register import ChatGPTProtocolRegister
+
+            # Each concurrent worker draws a distinct, internally-consistent
+            # device fingerprint from the shared pool.  This avoids every
+            # worker presenting the same screen/cpu/UA combination.
+            profile = next(_fingerprint_pool)
+            ctx.log(f"分配设备指纹: {profile.name}")
 
             return ChatGPTProtocolRegister(
                 proxy=ctx.proxy,
                 otp_callback=artifacts.otp_callback,
                 log_fn=ctx.log,
                 cancel_check=ctx.platform.is_cancel_requested,
+                profile=profile,
             )
 
         return ProtocolMailboxAdapter(
@@ -200,7 +192,7 @@ class ChatGPTPlatform(BasePlatform):
                 # sender/brand keyword here only causes valid messages to be
                 # discarded.
                 keyword="",
-                wait_message="等待 Outlook 验证码...",
+                wait_message="等待邮箱验证码...",
                 timeout=180,
             ),
         )
