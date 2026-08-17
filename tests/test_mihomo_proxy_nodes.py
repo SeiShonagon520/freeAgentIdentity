@@ -277,6 +277,11 @@ def test_mihomo_registration_allocator_keeps_worker_slots_sticky(monkeypatch):
     first.rotate()
     assert first.node == "Node B"
     assert first.node != old_node
+    # A transient timeout on every node must not permanently exhaust the
+    # allocator.  Node A remains reusable after its cooldown fallback.
+    second.rotate()
+    assert second.node == "Node A"
+    assert old_node not in allocator._failed_nodes
     assert any(path == "/proxies/REGISTER-SLOT-01" for _, path, _ in calls)
 
     first.release()

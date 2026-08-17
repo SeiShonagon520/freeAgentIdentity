@@ -216,7 +216,10 @@ def test_login_vpn_block_is_classified_for_proxy_rotation():
 
 
 def test_async_flow_never_polls_otp_twice_after_submission(monkeypatch):
-    stages = iter(["password", "password", "otp", "otp", "complete"])
+    # The post-submit page may remain on the OTP URL while navigation is
+    # queued behind other contexts.  It must neither poll twice nor fail on
+    # the old four-poll stuck threshold.
+    stages = iter(["password", "password", "otp", *("otp" for _ in range(6)), "complete"])
     otp_calls = []
 
     class Page:
@@ -267,6 +270,60 @@ def test_async_flow_never_polls_otp_twice_after_submission(monkeypatch):
 
     assert result == {"access_token": "token"}
     assert otp_calls == [True]
+
+
+def test_async_flow_allows_slow_email_verification_transition(monkeypatch):
+    stages = iter(
+        ["password", "password", *("email_verification" for _ in range(6)), "complete"]
+    )
+
+    class Page:
+        url = "https://auth.openai.com/email-verification"
+
+    async def no_sleep(_seconds):
+        return None
+
+    async def fake_stage(_page):
+        return next(stages)
+
+    async def fake_selector(_page, _selectors, **_kwargs):
+        return "input"
+
+    async def fake_fill(*_args, **_kwargs):
+        return True
+
+    async def fake_click(*_args, **_kwargs):
+        return "button"
+
+    async def fake_goto(*_args, **_kwargs):
+        return None
+
+    async def fake_session(*_args, **_kwargs):
+        return {"accessToken": "token"}
+
+    async def fake_result(*_args, **_kwargs):
+        return {"access_token": "token"}
+
+    monkeypatch.setattr(browser_register_async.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(browser_register_async, "_derive_stage_from_page", fake_stage)
+    monkeypatch.setattr(browser_register_async, "_wait_for_any_selector", fake_selector)
+    monkeypatch.setattr(browser_register_async, "_fill_input_like_user", fake_fill)
+    monkeypatch.setattr(browser_register_async, "_click_first", fake_click)
+    monkeypatch.setattr(browser_register_async, "_goto_with_retry", fake_goto)
+    monkeypatch.setattr(browser_register_async, "_fetch_session_via_page", fake_session)
+    monkeypatch.setattr(browser_register_async, "_build_session_result", fake_result)
+
+    result = asyncio.run(
+        browser_register_async._browser_registration_flow(
+            Page(),
+            "user@example.com",
+            "password",
+            lambda: "123456",
+            lambda *_args, **_kwargs: None,
+        )
+    )
+
+    assert result == {"access_token": "token"}
 
 
 def test_about_you_required_consent_is_checked_idempotently():

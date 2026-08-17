@@ -424,16 +424,28 @@ async def _capture_failure(page, *, reason: str, log) -> None:
         stem = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
         screenshot_path = target_dir / f"{stem}.png"
         metadata_path = target_dir / f"{stem}.json"
-        # Full-page screenshots force an expensive layout/paint of the whole
-        # document.  A viewport capture contains the visible error state and
-        # avoids a second CPU spike when many proxies fail together.
-        await page.screenshot(path=str(screenshot_path), full_page=False, timeout=10000)
         metadata = {**snapshot, "reason": str(reason)[:2000]}
         await asyncio.to_thread(
             metadata_path.write_text,
             json.dumps(metadata, ensure_ascii=False, indent=2),
             "utf-8",
         )
+        normalized_reason = str(reason or "").lower()
+        skip_screenshot = snapshot["url"] in {"", "about:blank"} or any(
+            marker in normalized_reason
+            for marker in (
+                "page.goto: timeout",
+                "代理导航 chatgpt 失败",
+                "邮箱提交后入口",
+            )
+        )
+        if skip_screenshot:
+            log(f"高频代理失败仅保存元数据: {metadata_path}", level="warning")
+            return
+        # Full-page screenshots force an expensive layout/paint of the whole
+        # document.  A viewport capture contains the visible error state and
+        # avoids a second CPU spike when many proxies fail together.
+        await page.screenshot(path=str(screenshot_path), full_page=False, timeout=10000)
         log(f"失败截图已保存: {screenshot_path}", level="warning")
     except Exception as exc:
         log(f"保存失败截图失败: {exc}", level="warning")
@@ -577,12 +589,17 @@ async def _browser_registration_flow(page, email: str, password: str, otp_callba
     seen: dict[str, int] = {}
     otp_submitted = False
     about_you_submitted = False
-    for step in range(12):
+    for step in range(20):
         stage = await _derive_stage_from_page(page)
         current_url = str(page.url or "")[:120]
         seen[stage] = seen.get(stage, 0) + 1
         log(f"注册推进 step={step + 1} stage={stage} url={current_url} seen={seen[stage]}")
-        if seen[stage] > 4 and stage != "cloudflare":
+        # OTP submission and the following email-verification transition can
+        # legitimately remain on the same URL for 10-20 seconds when 8 cores
+        # are saturated.  Treating the fifth poll as a hard failure caused
+        # false negatives at 24/30 concurrency.
+        stuck_limit = 10 if stage in {"otp", "email_verification"} else 4
+        if seen[stage] > stuck_limit and stage != "cloudflare":
             if stage in {"entry", "blocked", "unknown"}:
                 snapshot = await _page_snapshot(page)
                 raise BrowserProxyBlockedError(

@@ -622,12 +622,13 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback: Ca
     seen: dict[str, int] = {}
     otp_submitted = False
     about_you_submitted = False
-    for step in range(12):
+    for step in range(20):
         stage = _derive_stage_from_page(page)
         current_url = str(page.url or "")[:120]
         seen[stage] = seen.get(stage, 0) + 1
         log(f"注册推进 step={step + 1} stage={stage} url={current_url} seen={seen[stage]}")
-        if seen[stage] > 4:
+        stuck_limit = 10 if stage in {"otp", "email_verification"} else 4
+        if seen[stage] > stuck_limit:
             _dump_debug(page, "stuck", log)
             raise RuntimeError(f"注册状态卡住: stage={stage} url={current_url}")
 

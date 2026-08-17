@@ -250,7 +250,11 @@ class MihomoRegistrationAllocator:
             if lease.slot not in self._active:
                 raise MihomoNodeError("proxy slot has already been released")
             old_node = lease.node
-            self._failed_nodes.add(old_node)
+            # Browser navigation timeouts are not proof that the exit node is
+            # permanently bad.  Under 24-30 way CPU saturation a healthy node
+            # can time out once and succeed for another worker seconds later.
+            # Keep it on cooldown, but do not remove it for the whole task;
+            # otherwise a burst of transient failures can exhaust every node.
             self._blocked_until[old_node] = time.monotonic() + self._cooldown_seconds
             self._node_counts[old_node] = max(self._node_counts.get(old_node, 0) - 1, 0)
             excluded = {old_node}
