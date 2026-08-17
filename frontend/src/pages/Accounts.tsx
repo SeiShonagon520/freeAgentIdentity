@@ -96,7 +96,7 @@ function RegisterDialog({ onClose, onCreated }: { onClose: () => void, onCreated
   const [probeBatch, setProbeBatch] = useState('5')
   const [harCapture, setHarCapture] = useState(false)
   const [harCapture2fa, setHarCapture2fa] = useState(false)
-  const [bindTotp2fa, setBindTotp2fa] = useState(false)
+  const [bindTotp2fa, setBindTotp2fa] = useState(true)
   const [executorType, setExecutorType] = useState<'protocol' | 'headed' | 'headless'>('protocol')
 
   const loadProxyNodes = useCallback(async (refresh = false) => {

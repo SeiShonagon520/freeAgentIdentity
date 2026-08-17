@@ -296,11 +296,18 @@ def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
     executor_type = str(payload.get("executor_type") or "protocol") or "protocol"
     if executor_type not in ("protocol", "headless", "headed"):
         executor_type = "protocol"
+    extra = dict(payload.get("extra") or {})
+    # Automated headless registrations are expected to be immediately usable
+    # when copied/exported. Keep an explicit false as an opt-out, but make the
+    # default bind TOTP for API clients that omit the flag.
+    if executor_type == "headless" and "bind_totp_2fa" not in extra:
+        extra["bind_totp_2fa"] = True
     payload = {
         **payload,
         "platform": "chatgpt",
         "count": count,
         "executor_type": executor_type,
+        "extra": extra,
     }
     return create_task(
         task_type=TASK_TYPE_REGISTER,
@@ -859,6 +866,45 @@ def _persist_totp_secret(account_id: int, secret: str) -> None:
     )
 
 
+def _bind_registered_account_totp(
+    account: Any,
+    account_id: int,
+    *,
+    proxy: str | None = None,
+) -> str:
+    """Bind TOTP through the authenticated API and persist its secret."""
+    from curl_cffi import requests as _cffi_requests
+    from platforms.chatgpt.environment_profile import PROTOCOL_CHROME_IMPERSONATE
+    from platforms.chatgpt.mfa import bind_totp_2fa
+
+    access_token = _access_token_for_account(account)
+    if not access_token:
+        raise RuntimeError("注册结果缺少 access token，无法绑定 TOTP 2FA")
+
+    mfa_session = _cffi_requests.Session(
+        impersonate=PROTOCOL_CHROME_IMPERSONATE,
+        timeout=30,
+    )
+    try:
+        if proxy:
+            mfa_session.proxies = {"http": proxy, "https": proxy}
+        result = bind_totp_2fa(mfa_session, access_token)
+    finally:
+        close = getattr(mfa_session, "close", None)
+        if callable(close):
+            close()
+
+    if not result.get("activated"):
+        raise RuntimeError(
+            f"TOTP 激活未确认：{str(result.get('result') or result)[:160]}"
+        )
+    secret = str(result.get("secret") or "").strip()
+    if not secret:
+        raise RuntimeError("TOTP 已激活但接口未返回 secret")
+    _persist_totp_secret(account_id, secret)
+    return secret
+
+
 def _check_newly_registered_chatgpt_account(
     account: Any,
     *,
@@ -1335,6 +1381,29 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             saved_account_id = int(saved_account.id)
             if resolved_proxy and registration_allocator is None:
                 proxy_pool.report_success(resolved_proxy)
+            totp_result: dict[str, Any] = {
+                "requested": bool(extra.get("bind_totp_2fa")),
+                "bound": False,
+                "error": "",
+            }
+            if totp_result["requested"]:
+                logger.log(f"正在为 {account.email} 绑定 TOTP 2FA...")
+                try:
+                    _bind_registered_account_totp(
+                        account,
+                        saved_account_id,
+                        proxy=worker_proxy,
+                    )
+                except Exception as mfa_exc:
+                    totp_result["error"] = str(mfa_exc)[:200]
+                    logger.log(
+                        f"{account.email} TOTP 2FA 绑定失败（账号已保存）："
+                        f"{totp_result['error']}",
+                        level="error",
+                    )
+                else:
+                    totp_result["bound"] = True
+                    logger.log(f"{account.email} TOTP 2FA 绑定成功，secret 已保存")
             if sub2api_upload_config:
                 logger.log(f"正在上传 {account.email} 的 Agent Identity 到 Sub2API")
                 try:
@@ -1357,42 +1426,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     logger.log(f"{account.email} 的 Agent Identity 已上传到 Sub2API")
             logger.record_success()
             logger.log(f"注册成功: {account.email}")
-            # Optional: bind TOTP 2FA after registration (extra.bind_totp_2fa).
-            if bool(extra.get("bind_totp_2fa")):
-                logger.log(f"正在为 {account.email} 绑定 TOTP 2FA...")
-                try:
-                    from curl_cffi import requests as _cffi_requests
-                    from platforms.chatgpt.mfa import bind_totp_2fa
-                    from platforms.chatgpt.environment_profile import PROTOCOL_CHROME_IMPERSONATE
-
-                    _mfa_session = _cffi_requests.Session(
-                        impersonate=PROTOCOL_CHROME_IMPERSONATE, timeout=30
-                    )
-                    if worker_proxy:
-                        _mfa_session.proxies = {"http": worker_proxy, "https": worker_proxy}
-                    mfa_result = bind_totp_2fa(
-                        _mfa_session,
-                        _access_token_for_account(account),
-                    )
-                    if mfa_result.get("activated"):
-                        logger.log(
-                            f"{account.email} TOTP 2FA 绑定成功，secret 已保存"
-                        )
-                        _persist_totp_secret(saved_account_id, mfa_result.get("secret", ""))
-                    else:
-                        logger.log(
-                            f"{account.email} TOTP 2FA 绑定未确认：{str(mfa_result.get('result'))[:120]}",
-                            level="warning",
-                        )
-                except Exception as mfa_exc:
-                    logger.log(
-                        f"{account.email} TOTP 2FA 绑定失败（账号已保存）：{str(mfa_exc)[:150]}",
-                        level="warning",
-                    )
-            return {
+            registration_result: dict[str, Any] = {
                 "account_id": saved_account_id,
                 "email": account.email,
             }
+            if totp_result["requested"]:
+                registration_result["totp_2fa"] = totp_result
+            return registration_result
         except Exception as exc:
             # Proxy rotation (e.g. Cloudflare) changes the node behind this
             # worker's slot; keep the pulse controller's node attribution
