@@ -676,6 +676,9 @@ async def _browser_registration_flow(
 
     seen: dict[str, int] = {}
     password_submitted = False
+    password_stage_started_at: float | None = None
+    password_submitted_at: float | None = None
+    password_submit_retried = False
     password_fallback_requested_at: float | None = None
     password_fallback_attempts = 0
     otp_submitted = False
@@ -693,7 +696,7 @@ async def _browser_registration_flow(
         # OTP and email verification use explicit elapsed-time deadlines below.
         # Count-based limits are too sensitive to scheduler speed at 30-way load.
         if (
-            stage not in {"otp", "email_verification", "cloudflare"}
+            stage not in {"password", "otp", "email_verification", "cloudflare"}
             and seen[stage] > 4
         ):
             if stage in {"entry", "blocked", "unknown"}:
@@ -756,7 +759,35 @@ async def _browser_registration_flow(
             return result
 
         if stage == "password":
+            now = time.monotonic()
+            if password_stage_started_at is None:
+                password_stage_started_at = now
+            if now - password_stage_started_at >= 60:
+                raise RuntimeError(
+                    f"密码设置页 60 秒未完成: url={current_url}"
+                )
             if password_submitted:
+                submitted_at = password_submitted_at or now
+                elapsed = now - submitted_at
+                if elapsed >= 45:
+                    raise RuntimeError(
+                        f"密码提交后 45 秒未跳转: url={current_url}"
+                    )
+                if elapsed >= 12 and not password_submit_retried:
+                    clicked = await _click_first(
+                        page,
+                        PASSWORD_SUBMIT_SELECTORS,
+                        timeout=3,
+                    )
+                    if not clicked:
+                        selector = await _find_visible_selector(
+                            page,
+                            PASSWORD_INPUT_SELECTORS,
+                        )
+                        if selector:
+                            await _submit_visible_form(page, selector)
+                    password_submit_retried = True
+                    log("密码页未跳转，已重试提交一次", level="warning")
                 await asyncio.sleep(2)
                 continue
             selector = await _wait_for_any_selector(page, PASSWORD_INPUT_SELECTORS, timeout=15)
@@ -768,6 +799,7 @@ async def _browser_registration_flow(
                 await _submit_visible_form(page, selector)
                 log("密码页已用 Enter 提交")
             password_submitted = True
+            password_submitted_at = time.monotonic()
             await asyncio.sleep(2)
             continue
 

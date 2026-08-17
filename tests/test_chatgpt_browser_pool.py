@@ -557,6 +557,65 @@ def test_async_flow_forces_password_setup_before_polling_signup_otp(monkeypatch)
     assert ("input[type=password]", "StrongPass123!") in fills
 
 
+def test_async_flow_allows_slow_password_submit_transition(monkeypatch):
+    stages = iter([*("password" for _ in range(8)), "complete"])
+    fills = []
+
+    class Page:
+        url = "https://auth.openai.com/create-account/password"
+
+    async def no_sleep(_seconds):
+        return None
+
+    async def fake_stage(_page):
+        return next(stages)
+
+    async def fake_selector(_page, selectors, **_kwargs):
+        if selectors == browser_register_async.EMAIL_INPUT_SELECTORS:
+            return "input[type=email]"
+        return "input[type=password]"
+
+    async def fake_fill(_page, selector, value):
+        fills.append((selector, value))
+        return True
+
+    async def fake_click(*_args, **_kwargs):
+        return "button"
+
+    async def fake_goto(*_args, **_kwargs):
+        return None
+
+    async def fake_session(*_args, **_kwargs):
+        return {"accessToken": "token"}
+
+    async def fake_result(*_args, **_kwargs):
+        return {"access_token": "token"}
+
+    monkeypatch.setattr(browser_register_async.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(browser_register_async, "_derive_stage_from_page", fake_stage)
+    monkeypatch.setattr(browser_register_async, "_wait_for_any_selector", fake_selector)
+    monkeypatch.setattr(browser_register_async, "_fill_input_like_user", fake_fill)
+    monkeypatch.setattr(browser_register_async, "_click_first", fake_click)
+    monkeypatch.setattr(browser_register_async, "_goto_with_retry", fake_goto)
+    monkeypatch.setattr(browser_register_async, "_fetch_session_via_page", fake_session)
+    monkeypatch.setattr(browser_register_async, "_build_session_result", fake_result)
+
+    result = asyncio.run(
+        browser_register_async._browser_registration_flow(
+            Page(),
+            "user@example.com",
+            "StrongPass123!",
+            lambda: "123456",
+            lambda *_args, **_kwargs: None,
+        )
+    )
+
+    assert result == {"access_token": "token"}
+    assert [item for item in fills if item[0] == "input[type=password]"] == [
+        ("input[type=password]", "StrongPass123!")
+    ]
+
+
 def test_async_flow_rejects_completed_passwordless_account(monkeypatch):
     stages = iter(["complete", "complete", "complete"])
 
