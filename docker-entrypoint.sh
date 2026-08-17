@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+# Docker restart keeps the container filesystem.  Xvfb itself is gone, but its
+# lock/socket may remain and make the next boot report "Server is already
+# active for display 99".
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+mkdir -p /tmp/.X11-unix
+
 # 启动虚拟显示
 Xvfb :99 -screen 0 1280x800x24 -nolisten tcp &
 export DISPLAY=:99

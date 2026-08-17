@@ -1,0 +1,502 @@
+# Copy this file to config.yaml on the deployment host and replace the
+# subscription URL. config.yaml is ignored by Git and the Docker build context.
+mixed-port: 7890
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+
+# The controller and mixed proxy port are only exposed to the private compose
+# network; docker-compose.yml does not publish either port to the host.
+external-controller: 0.0.0.0:9090
+secret: ""
+
+profile:
+  store-selected: true
+  store-fake-ip: false
+
+proxy-providers:
+  registration-subscription:
+    type: http
+    url: "REPLACE_WITH_CLASH_SUBSCRIPTION_URL"
+    header:
+      User-Agent:
+        - "Clash.Meta"
+    path: ./providers/registration-subscription.yaml
+    interval: 3600
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 300
+      lazy: false
+
+proxy-groups:
+  - name: REGISTER-ALL
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-US
+    type: select
+    use:
+      - registration-subscription
+    filter: '(?i)(🇺🇸|美国|美國|United States|\bUS\b|USA)'
+  - name: REGISTER-SLOT-01
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-02
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-03
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-04
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-05
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-06
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-07
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-08
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-09
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-10
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-11
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-12
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-13
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-14
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-15
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-16
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-17
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-18
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-19
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-20
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-21
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-22
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-23
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-24
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-25
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-26
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-27
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-28
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-29
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-30
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-31
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-32
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-33
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-34
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-35
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-36
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-37
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-38
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-39
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-40
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-41
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-42
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-43
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-44
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-45
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-46
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-47
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-48
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-49
+    type: select
+    use:
+      - registration-subscription
+  - name: REGISTER-SLOT-50
+    type: select
+    use:
+      - registration-subscription
+
+listeners:
+  - name: REGISTER-IN-01
+    type: mixed
+    port: 7901
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-01
+  - name: REGISTER-IN-02
+    type: mixed
+    port: 7902
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-02
+  - name: REGISTER-IN-03
+    type: mixed
+    port: 7903
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-03
+  - name: REGISTER-IN-04
+    type: mixed
+    port: 7904
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-04
+  - name: REGISTER-IN-05
+    type: mixed
+    port: 7905
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-05
+  - name: REGISTER-IN-06
+    type: mixed
+    port: 7906
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-06
+  - name: REGISTER-IN-07
+    type: mixed
+    port: 7907
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-07
+  - name: REGISTER-IN-08
+    type: mixed
+    port: 7908
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-08
+  - name: REGISTER-IN-09
+    type: mixed
+    port: 7909
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-09
+  - name: REGISTER-IN-10
+    type: mixed
+    port: 7910
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-10
+  - name: REGISTER-IN-11
+    type: mixed
+    port: 7911
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-11
+  - name: REGISTER-IN-12
+    type: mixed
+    port: 7912
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-12
+  - name: REGISTER-IN-13
+    type: mixed
+    port: 7913
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-13
+  - name: REGISTER-IN-14
+    type: mixed
+    port: 7914
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-14
+  - name: REGISTER-IN-15
+    type: mixed
+    port: 7915
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-15
+  - name: REGISTER-IN-16
+    type: mixed
+    port: 7916
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-16
+  - name: REGISTER-IN-17
+    type: mixed
+    port: 7917
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-17
+  - name: REGISTER-IN-18
+    type: mixed
+    port: 7918
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-18
+  - name: REGISTER-IN-19
+    type: mixed
+    port: 7919
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-19
+  - name: REGISTER-IN-20
+    type: mixed
+    port: 7920
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-20
+  - name: REGISTER-IN-21
+    type: mixed
+    port: 7921
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-21
+  - name: REGISTER-IN-22
+    type: mixed
+    port: 7922
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-22
+  - name: REGISTER-IN-23
+    type: mixed
+    port: 7923
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-23
+  - name: REGISTER-IN-24
+    type: mixed
+    port: 7924
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-24
+  - name: REGISTER-IN-25
+    type: mixed
+    port: 7925
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-25
+  - name: REGISTER-IN-26
+    type: mixed
+    port: 7926
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-26
+  - name: REGISTER-IN-27
+    type: mixed
+    port: 7927
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-27
+  - name: REGISTER-IN-28
+    type: mixed
+    port: 7928
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-28
+  - name: REGISTER-IN-29
+    type: mixed
+    port: 7929
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-29
+  - name: REGISTER-IN-30
+    type: mixed
+    port: 7930
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-30
+  - name: REGISTER-IN-31
+    type: mixed
+    port: 7931
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-31
+  - name: REGISTER-IN-32
+    type: mixed
+    port: 7932
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-32
+  - name: REGISTER-IN-33
+    type: mixed
+    port: 7933
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-33
+  - name: REGISTER-IN-34
+    type: mixed
+    port: 7934
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-34
+  - name: REGISTER-IN-35
+    type: mixed
+    port: 7935
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-35
+  - name: REGISTER-IN-36
+    type: mixed
+    port: 7936
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-36
+  - name: REGISTER-IN-37
+    type: mixed
+    port: 7937
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-37
+  - name: REGISTER-IN-38
+    type: mixed
+    port: 7938
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-38
+  - name: REGISTER-IN-39
+    type: mixed
+    port: 7939
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-39
+  - name: REGISTER-IN-40
+    type: mixed
+    port: 7940
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-40
+  - name: REGISTER-IN-41
+    type: mixed
+    port: 7941
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-41
+  - name: REGISTER-IN-42
+    type: mixed
+    port: 7942
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-42
+  - name: REGISTER-IN-43
+    type: mixed
+    port: 7943
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-43
+  - name: REGISTER-IN-44
+    type: mixed
+    port: 7944
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-44
+  - name: REGISTER-IN-45
+    type: mixed
+    port: 7945
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-45
+  - name: REGISTER-IN-46
+    type: mixed
+    port: 7946
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-46
+  - name: REGISTER-IN-47
+    type: mixed
+    port: 7947
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-47
+  - name: REGISTER-IN-48
+    type: mixed
+    port: 7948
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-48
+  - name: REGISTER-IN-49
+    type: mixed
+    port: 7949
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-49
+  - name: REGISTER-IN-50
+    type: mixed
+    port: 7950
+    listen: 0.0.0.0
+    proxy: REGISTER-SLOT-50
+rules:
+  # Provider bootstrap must stay direct, otherwise the first subscription
+  # fetch can recurse through an empty REGISTER-US group.
+  - DOMAIN,liangxin.xyz,DIRECT
+  - MATCH,REGISTER-ALL

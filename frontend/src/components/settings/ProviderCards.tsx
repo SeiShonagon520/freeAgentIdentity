@@ -1,11 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
-import { apiFetch } from '@/lib/utils'
+import { apiFetch, apiForm } from '@/lib/utils'
 import { useI18n } from '@/lib/i18n-context'
 import type { TranslationKey } from '@/lib/i18n'
 import type { ProviderOption, ProviderSetting } from '@/lib/config-options'
 import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
-import { Save, Eye, EyeOff, X, Pencil, Plus, Trash2, FlaskConical, Search } from 'lucide-react'
+import { Save, Eye, EyeOff, X, Pencil, Plus, Trash2, FlaskConical, Search, FileUp } from 'lucide-react'
 import { invalidateConfigOptionsCache } from '@/lib/app-data'
 
 const CATEGORY_GROUPS = [
@@ -144,6 +143,42 @@ function EditModal({
   const [testResult, setTestResult] = useState<{ ok: boolean; message?: string; error?: string } | null>(null)
   const [asyncOptions, setAsyncOptions] = useState<Record<string, Array<{ value: string; label: string }>>>({})
   const [asyncLoading, setAsyncLoading] = useState<Record<string, boolean>>({})
+  const [mailboxStats, setMailboxStats] = useState({ total: 0, capacity: 0, used: 0, remaining: 0, exhausted: 0 })
+  const [importingMailboxes, setImportingMailboxes] = useState(false)
+  const [mailboxImportResult, setMailboxImportResult] = useState('')
+  const [mailboxImportError, setMailboxImportError] = useState('')
+
+  const loadMailboxStats = async () => {
+    if (provider.value !== 'local_ms_pool') return
+    const stats = await apiFetch('/microsoft-mailboxes/stats')
+    setMailboxStats(stats)
+  }
+
+  const importMailboxFiles = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || [])
+    if (!files.length) return
+    event.target.value = ''
+    setImportingMailboxes(true)
+    setMailboxImportResult('')
+    setMailboxImportError('')
+    try {
+      const body = new FormData()
+      files.forEach(file => body.append('files', file, file.name))
+      const result = await apiForm('/microsoft-mailboxes/import', body)
+      setMailboxImportResult(
+        `已处理 ${result.files} 个文件，新增 ${result.inserted} 个，更新 ${result.updated} 个，剩余 ${result.remaining} 次`,
+      )
+      await loadMailboxStats()
+    } catch (error: any) {
+      setMailboxImportError(error?.message || '微软邮箱导入失败')
+    } finally {
+      setImportingMailboxes(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadMailboxStats().catch(() => undefined)
+  }, [provider.value]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // 加载 async-select 字段的选项
   useEffect(() => {
@@ -193,7 +228,7 @@ function EditModal({
             id: setting.id, provider_type: providerType, provider_key: provider.value,
             display_name: setting.display_name || provider.label,
             auth_mode: setting.auth_mode || provider.default_auth_mode || '',
-            enabled: true, is_default: setting.is_default, config, auth, metadata: {},
+            enabled: true, is_default: providerType === 'mailbox' ? false : setting.is_default, config, auth, metadata: {},
           }),
         })
       } else {
@@ -249,6 +284,40 @@ function EditModal({
           <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text-primary)]"><X className="h-4 w-4" /></button>
         </div>
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+          {provider.value === 'local_ms_pool' && (
+            <div className="space-y-3 border-b border-[var(--border)] pb-4">
+              <div className="grid grid-cols-2 gap-px overflow-hidden rounded-md border border-[var(--border)] bg-[var(--border)] sm:grid-cols-4">
+                {[
+                  ['邮箱', mailboxStats.total],
+                  ['总容量', mailboxStats.capacity],
+                  ['已使用', mailboxStats.used],
+                  ['剩余', mailboxStats.remaining],
+                ].map(([label, value]) => (
+                  <div key={String(label)} className="bg-[var(--bg-pane)] px-3 py-2">
+                    <div className="text-xs text-[var(--text-muted)]">{label}</div>
+                    <div className="mt-0.5 text-base font-semibold text-[var(--text-primary)]">{value}</div>
+                  </div>
+                ))}
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <label className={`inline-flex items-center gap-1.5 rounded-md border border-[var(--border)] px-3 py-2 text-sm text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] ${importingMailboxes ? 'cursor-wait opacity-50' : 'cursor-pointer'}`}>
+                  <FileUp className="h-4 w-4" />
+                  {importingMailboxes ? '正在导入...' : '导入 TXT'}
+                  <input
+                    type="file"
+                    multiple
+                    accept=".txt,text/plain"
+                    disabled={importingMailboxes}
+                    className="sr-only"
+                    onChange={event => void importMailboxFiles(event)}
+                  />
+                </label>
+                <span className="text-xs text-[var(--text-muted)]">支持多文件，重复邮箱更新凭据但保留使用次数</span>
+              </div>
+              {mailboxImportResult && <div className="text-xs text-emerald-500">{mailboxImportResult}</div>}
+              {mailboxImportError && <div className="text-xs text-red-500">{mailboxImportError}</div>}
+            </div>
+          )}
           {fields.length === 0 ? (
             <p className="text-sm text-[var(--text-muted)]">{t('providers.noConfig')}</p>
           ) : fields.map(field => {
@@ -360,8 +429,6 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
 
   const settingsMap: Record<string, ProviderSetting> = {}
   for (const s of settings) settingsMap[s.provider_key] = s
-  const defaultKey = settings.find(s => s.is_default)?.provider_key || ''
-
   const grouped: Record<string, ProviderOption[]> = {}
   for (const p of catalog) {
     const cat = p.category || 'custom'
@@ -382,27 +449,12 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
         body: JSON.stringify({
           provider_type: providerType, provider_key: provider.value,
           display_name: provider.label, auth_mode: provider.default_auth_mode || '',
-          enabled: true, is_default: settings.length === 0, config: {}, auth: {}, metadata: {},
+          enabled: true, is_default: false, config: {}, auth: {}, metadata: {},
         }),
       })
     } else if (!enable && setting) {
       await apiFetch(`/provider-settings/${setting.id}`, { method: 'DELETE' })
     }
-    invalidateConfigOptionsCache()
-    await onReload()
-  })
-
-  const handleSetDefault = (provider: ProviderOption) => withLoading(provider.value, async () => {
-    const setting = settingsMap[provider.value]
-    if (!setting) return
-    await apiFetch('/provider-settings', {
-      method: 'PUT',
-      body: JSON.stringify({
-        id: setting.id, provider_type: providerType, provider_key: provider.value,
-        display_name: setting.display_name, auth_mode: setting.auth_mode,
-        enabled: true, is_default: true, config: setting.config, auth: setting.auth, metadata: {},
-      }),
-    })
     invalidateConfigOptionsCache()
     await onReload()
   })
@@ -453,7 +505,6 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
     const key = provider.value
     const setting = settingsMap[key]
     const isEnabled = !!setting
-    const isDefault = key === defaultKey
     const hasFields = (provider.fields || []).length > 0
 
     return (
@@ -463,7 +514,6 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <span className="text-sm font-medium text-[var(--text-primary)]">{provider.label}</span>
-              {isDefault && <Badge variant="success">{t('providers.default')}</Badge>}
             </div>
             {provider.description && (
               <p className="mt-0.5 text-xs text-[var(--text-muted)] line-clamp-1">{provider.description}</p>
@@ -488,19 +538,11 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
               <FlaskConical className="h-3 w-3 mr-1" /> {testingKeys[key] ? t('providers.testing') : t('providers.test')}
             </button>
 
-            <button
-              onClick={() => isEnabled && !isDefault ? handleSetDefault(provider) : undefined}
-              disabled={!isEnabled || isDefault || loading[key]}
-              className={`table-action-btn ${(!isEnabled || isDefault) ? 'opacity-30 cursor-not-allowed' : ''}`}
-            >
-              {isDefault ? t('providers.defaultDone') : t('providers.setDefault')}
-            </button>
-
             {allowDelete && (
               <button
                 onClick={() => isEnabled ? handleDelete(provider) : undefined}
-                disabled={!isEnabled || isDefault || loading[key]}
-                className={`table-action-btn table-action-btn-danger ${(!isEnabled || isDefault) ? 'opacity-30 cursor-not-allowed' : ''}`}
+                disabled={!isEnabled || loading[key]}
+                className={`table-action-btn table-action-btn-danger ${!isEnabled ? 'opacity-30 cursor-not-allowed' : ''}`}
               >
                 <Trash2 className="h-3 w-3 mr-1" /> {t('common.delete')}
               </button>
@@ -509,7 +551,7 @@ export default function ProviderCards({ providerType, catalog, settings, onReloa
             <Toggle
               checked={isEnabled}
               onChange={v => handleToggle(provider, v)}
-              disabled={loading[key] || isDefault}
+              disabled={loading[key]}
             />
           </div>
         </div>

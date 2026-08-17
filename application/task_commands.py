@@ -9,10 +9,9 @@ from application.tasks import (
     TASK_STATUS_FAILED,
     TASK_STATUS_INTERRUPTED,
     TERMINAL_TASK_STATUSES,
-    register_sub2api_upload_configs_guard,
-    set_register_sub2api_upload_config,
     create_register_task,
     get_task,
+    list_latest_task_events,
     list_task_events,
     request_cancel,
 )
@@ -23,20 +22,8 @@ class TaskCommandsService:
     def create_register_task(
         self,
         payload: dict,
-        *,
-        sub2api_upload: dict[str, str] | None = None,
     ) -> dict:
-        # Keep the key out of the persistent task payload.  The shared guard
-        # prevents the runtime from claiming this task before its volatile
-        # upload config has been attached.
-        with register_sub2api_upload_configs_guard():
-            task = create_register_task(payload)
-            if sub2api_upload:
-                set_register_sub2api_upload_config(
-                    str(task["id"]),
-                    sub2api_url=sub2api_upload.get("sub2api_url", ""),
-                    api_key=sub2api_upload.get("api_key", ""),
-                )
+        task = create_register_task(payload)
         task_runtime.wake_up()
         return task
 
@@ -46,8 +33,9 @@ class TaskCommandsService:
             task_runtime.wake_up()
         return task
 
-    async def stream_task_events(self, task_id: str, *, since: int = 0) -> AsyncIterator[str]:
+    async def stream_task_events(self, task_id: str, *, since: int = 0, tail: int = 300) -> AsyncIterator[str]:
         cursor = since
+        initial_tail = cursor <= 0 and tail > 0
         terminal_sent = False
         heartbeat_interval = 10.0
         loop = asyncio.get_running_loop()
@@ -58,7 +46,11 @@ class TaskCommandsService:
 
         while True:
             emitted = False
-            items = list_task_events(task_id, since=cursor, limit=200)
+            if initial_tail:
+                items = list_latest_task_events(task_id, limit=tail)
+                initial_tail = False
+            else:
+                items = list_task_events(task_id, since=cursor, limit=200)
             for item in items:
                 cursor = max(cursor, int(item["id"] or 0))
                 yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"

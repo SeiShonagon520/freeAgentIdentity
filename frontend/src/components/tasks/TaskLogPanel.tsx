@@ -24,6 +24,7 @@ type LogGroup = {
 };
 
 const MAIN_GROUP_ID = "__main__";
+const MAX_RENDERED_EVENTS = 500;
 
 function classifyLine(line: string): string {
   if (line.includes("✓") || line.includes("成功")) return "text-emerald-400";
@@ -35,9 +36,11 @@ function classifyLine(line: string): string {
 export function TaskLogPanel({
   taskId,
   onDone,
+  compact = false,
 }: {
   taskId: string;
-  onDone: (status: string) => void;
+  onDone?: (status: string) => void;
+  compact?: boolean;
 }) {
   const { t, language } = useI18n();
   const [events, setEvents] = useState<LogEvent[]>([]);
@@ -48,12 +51,12 @@ export function TaskLogPanel({
   const seenEventIdsRef = useRef<Set<number>>(new Set());
   const cursorRef = useRef(0);
   const doneRef = useRef(false);
-  const onDoneRef = useRef(onDone);
+  const onDoneRef = useRef(onDone || (() => {}));
   const sseHealthyRef = useRef(false);
   const eventSourceRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
-    onDoneRef.current = onDone;
+    onDoneRef.current = onDone || (() => {});
   }, [onDone]);
 
   useEffect(() => {
@@ -76,15 +79,20 @@ export function TaskLogPanel({
       }
       if (payload?.line) {
         const detail = payload?.detail || {};
-        setEvents((prev) => [
-          ...prev,
-          {
-            id: eventId || prev.length + 1,
-            line: String(payload.line),
-            subtaskId: String(detail?.subtask_id || ""),
-            subtaskLabel: String(detail?.subtask_label || ""),
-          },
-        ]);
+        setEvents((prev) => {
+          const next = [
+            ...prev,
+            {
+              id: eventId || prev.length + 1,
+              line: String(payload.line),
+              subtaskId: String(detail?.subtask_id || ""),
+              subtaskLabel: String(detail?.subtask_label || ""),
+            },
+          ];
+          return next.length > MAX_RENDERED_EVENTS
+            ? next.slice(next.length - MAX_RENDERED_EVENTS)
+            : next;
+        });
       }
       if (payload?.done && !doneRef.current) {
         doneRef.current = true;
@@ -105,7 +113,14 @@ export function TaskLogPanel({
       }
     };
 
-    const es = new EventSource(`${API_BASE}/tasks/${taskId}/logs/stream`);
+    const syncLatestEvents = async () => {
+      const data = await apiFetch(`/tasks/${taskId}/events?tail=300`);
+      for (const item of data.items || []) {
+        pushEvent(item);
+      }
+    };
+
+    const es = new EventSource(`${API_BASE}/tasks/${taskId}/logs/stream?tail=300`);
     eventSourceRef.current = es;
     es.onopen = () => {
       sseHealthyRef.current = true;
@@ -126,6 +141,11 @@ export function TaskLogPanel({
     };
 
     syncTask().catch(() => {});
+    // A refresh starts from the current tail instead of replaying a long task
+    // from its first event.  The EventSource path handles low-latency updates;
+    // this authenticated fetch is also the fallback when SSE cannot carry a
+    // bearer header.
+    syncLatestEvents().catch(() => {});
 
     // 进度需要持续轮询：SSE 只发 events，progress 在 task model 上，
     // 必须主动 GET /tasks/{id} 拿。原实现里只在 SSE 不健康时轮询，导致
@@ -213,6 +233,10 @@ export function TaskLogPanel({
       ?.writeText(events.map((ev) => ev.line).join("\n"))
       .catch(() => {});
   };
+
+  if (compact) {
+    return <CompactTaskLog events={events} />;
+  }
 
   return (
     <div className="flex h-full flex-col gap-4">
@@ -310,6 +334,37 @@ export function TaskLogPanel({
         )}
       </div>
     </div>
+  );
+}
+
+function CompactTaskLog({ events }: { events: LogEvent[] }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [events.length]);
+
+  return (
+    <section className="flex h-[300px] flex-col overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-input)]">
+      <div className="flex shrink-0 items-center justify-between border-b border-[var(--border)] px-3 py-2 text-xs">
+        <span className="font-medium text-[var(--text-secondary)]">实时日志</span>
+        <span className="text-[var(--text-muted)]">最近 {events.length} 条</span>
+      </div>
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto p-3 font-mono text-xs leading-5">
+        {events.length === 0 ? (
+          <div className="flex h-full items-center justify-center text-[var(--text-muted)]">等待后端日志…</div>
+        ) : (
+          <div className="space-y-1">
+            {events.map((event) => (
+              <div key={event.id} className={`break-words ${classifyLine(event.line)}`}>
+                {event.line}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 

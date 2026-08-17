@@ -48,7 +48,7 @@ from core.server_guard import guard_duplicate_start
 
 guard_duplicate_start()
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -68,9 +68,11 @@ from api.auth import router as auth_router
 from api.config import router as config_router
 from core.auth import AuthMiddleware
 from api.health import router as health_router
+from api.microsoft_mailboxes import router as microsoft_mailboxes_router
 from api.platforms import router as platforms_router
 from api.provider_definitions import router as provider_definitions_router
 from api.provider_settings import router as provider_settings_router
+from api.proxy_nodes import router as proxy_nodes_router
 from api.system import router as system_router
 from api.task_commands import router as task_commands_router
 from api.tasks import router as tasks_router
@@ -87,23 +89,28 @@ async def lifespan(app: FastAPI):
     print("[OK] 数据库初始化完成")
     from core.registry import list_platforms
     print(f"[OK] 已加载平台: {[p['name'] for p in list_platforms()]}")
-    from core.scheduler import scheduler
-    scheduler.start()
+    background_jobs_enabled = os.getenv(
+        "BACKGROUND_JOBS_ENABLED", "1"
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    if background_jobs_enabled:
+        from core.scheduler import scheduler
+
+        scheduler.start()
     from services.task_runtime import task_runtime
     task_runtime.start()
-    from services.solver_manager import start_async
-    start_async()
-    from core.lifecycle import lifecycle_manager
-    lifecycle_manager.start()
+    if background_jobs_enabled:
+        from core.lifecycle import lifecycle_manager
+
+        lifecycle_manager.start()
     yield
-    from core.lifecycle import lifecycle_manager as _lifecycle_manager
-    _lifecycle_manager.stop()
-    from core.scheduler import scheduler as _scheduler
-    _scheduler.stop()
+    if background_jobs_enabled:
+        from core.lifecycle import lifecycle_manager as _lifecycle_manager
+        from core.scheduler import scheduler as _scheduler
+
+        _lifecycle_manager.stop()
+        _scheduler.stop()
     from services.task_runtime import task_runtime as _task_runtime
     _task_runtime.stop()
-    from services.solver_manager import stop
-    stop()
 
 
 app = FastAPI(title="Account Manager", version="2.0.0", lifespan=lifespan)
@@ -122,9 +129,11 @@ app.include_router(actions_router, prefix="/api")
 app.include_router(auth_router, prefix="/api")
 app.include_router(config_router, prefix="/api")
 app.include_router(health_router, prefix="/api")
+app.include_router(microsoft_mailboxes_router, prefix="/api")
 app.include_router(platforms_router, prefix="/api")
 app.include_router(provider_definitions_router, prefix="/api")
 app.include_router(provider_settings_router, prefix="/api")
+app.include_router(proxy_nodes_router, prefix="/api")
 app.include_router(tasks_router, prefix="/api")
 app.include_router(task_commands_router, prefix="/api")
 app.include_router(system_router, prefix="/api")
@@ -136,6 +145,8 @@ if os.path.isdir(_static_dir):
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa_fallback(full_path: str):
+        if full_path.startswith("api/"):
+            raise HTTPException(404, "API endpoint not found")
         return FileResponse(os.path.join(_static_dir, "index.html"))
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from application.tasks import get_task, list_task_events
+from application.tasks import get_task, list_latest_task_events, list_task_events, list_tasks
 from core.datetime_utils import ensure_utc_datetime
 from domain.tasks import TaskEvent, TaskProgress, TaskSummary
 
@@ -12,6 +12,8 @@ def _to_task_summary(data: dict) -> TaskSummary:
         type=data.get("type", ""),
         platform=data.get("platform", ""),
         status=data.get("status", ""),
+        terminal=bool(data.get("terminal", False)),
+        cancellable=bool(data.get("cancellable", False)),
         progress=TaskProgress(
             current=int(progress_raw.get("current", 0) or 0),
             total=int(progress_raw.get("total", 0) or 0),
@@ -21,6 +23,7 @@ def _to_task_summary(data: dict) -> TaskSummary:
         error_count=int(data.get("error_count", 0) or 0),
         errors=list(data.get("errors", [])),
         cashier_urls=list(data.get("cashier_urls", [])),
+        data=data.get("data"),
         error=str(data.get("error", "")),
         created_at=ensure_utc_datetime(data.get("created_at")),
         started_at=ensure_utc_datetime(data.get("started_at")),
@@ -48,5 +51,14 @@ class TasksReadRepository:
         data = get_task(task_id)
         return _to_task_summary(data) if data else None
 
+    def list(self, *, task_type: str = "", limit: int = 100, active_only: bool = False) -> list[TaskSummary]:
+        return [
+            _to_task_summary(item)
+            for item in list_tasks(task_type=task_type, limit=limit, active_only=active_only)
+        ]
+
     def list_events(self, task_id: str, *, since: int = 0, limit: int = 200) -> list[TaskEvent]:
         return [_to_event(item) for item in list_task_events(task_id, since=since, limit=limit)]
+
+    def list_latest_events(self, task_id: str, *, limit: int = 300) -> list[TaskEvent]:
+        return [_to_event(item) for item in list_latest_task_events(task_id, limit=limit)]

@@ -19,7 +19,13 @@ def _default_database_url() -> str:
 
 
 DATABASE_URL = os.getenv("ACCOUNT_MANAGER_DATABASE_URL", _default_database_url())
-engine = create_engine(DATABASE_URL)
+# A credential-check task can complete hundreds of network requests at once.
+# SQLite still permits only one writer, so wait for the short graph-write
+# transaction instead of failing a completed check with "database is locked".
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False, "timeout": 30},
+)
 
 
 class AccountModel(SQLModel, table=True):
@@ -32,6 +38,19 @@ class AccountModel(SQLModel, table=True):
     user_id: str = ""
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class RegisteredEmailHistoryModel(SQLModel, table=True):
+    __tablename__ = "registered_email_history"
+    __table_args__ = (
+        UniqueConstraint("platform", "email", name="uq_registered_email_history_platform_email"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    platform: str = Field(index=True)
+    email: str = Field(index=True)
+    first_registered_at: datetime = Field(default_factory=_utcnow)
+    last_registered_at: datetime = Field(default_factory=_utcnow)
 
 
 class AccountOverviewModel(SQLModel, table=True):
@@ -207,6 +226,42 @@ class ProviderSettingModel(SQLModel, table=True):
         self.metadata_json = json.dumps(data or {}, ensure_ascii=False)
 
 
+class MicrosoftMailboxModel(SQLModel, table=True):
+    __tablename__ = "microsoft_mailboxes"
+    __table_args__ = (
+        UniqueConstraint("email_key", name="uq_microsoft_mailboxes_email_key"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(index=True)
+    email_key: str = Field(index=True)
+    password_ciphertext: str = ""
+    login_account: str = ""
+    imap_host: str = ""
+    imap_port: str = ""
+    imap_account_type: str = ""
+    imap_security: str = ""
+    smtp_host: str = ""
+    smtp_port: str = ""
+    smtp_security: str = ""
+    note: str = ""
+    proxy_mode: str = ""
+    proxy: str = ""
+    label: str = ""
+    recovery_email: str = ""
+    recovery_password_ciphertext: str = ""
+    client_id: str = ""
+    refresh_token_ciphertext: str = ""
+    totp_secret_ciphertext: str = ""
+    source_format: str = ""
+    use_count: int = Field(default=0, index=True)
+    max_uses: int = 6
+    status: str = Field(default="available", index=True)
+    last_reserved_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
 class TaskModel(SQLModel, table=True):
     __tablename__ = "tasks"
 
@@ -306,6 +361,112 @@ def save_account(account) -> 'AccountModel':
         session.commit()
         session.refresh(m)
         return m
+
+
+def _normalized_history_key(platform: str, email: str) -> tuple[str, str]:
+    return str(platform or "").strip().lower(), str(email or "").strip().lower()
+
+
+def _normalized_utc(value: datetime | None) -> datetime:
+    value = value or _utcnow()
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def record_registered_email(
+    platform: str,
+    email: str,
+    *,
+    registered_at: datetime | None = None,
+) -> bool:
+    """Persist one successfully registered email without storing credentials."""
+    normalized_platform, normalized_email = _normalized_history_key(platform, email)
+    if not normalized_platform or "@" not in normalized_email or any(char.isspace() for char in normalized_email):
+        return False
+    occurred_at = _normalized_utc(registered_at)
+    with Session(engine) as session:
+        existing = session.exec(
+            select(RegisteredEmailHistoryModel)
+            .where(RegisteredEmailHistoryModel.platform == normalized_platform)
+            .where(RegisteredEmailHistoryModel.email == normalized_email)
+        ).first()
+        if existing:
+            existing.first_registered_at = min(
+                _normalized_utc(existing.first_registered_at),
+                occurred_at,
+            )
+            existing.last_registered_at = max(
+                _normalized_utc(existing.last_registered_at),
+                occurred_at,
+            )
+            session.add(existing)
+        else:
+            session.add(RegisteredEmailHistoryModel(
+                platform=normalized_platform,
+                email=normalized_email,
+                first_registered_at=occurred_at,
+                last_registered_at=occurred_at,
+            ))
+        session.commit()
+    return True
+
+
+def _backfill_registered_email_history() -> None:
+    """Seed history from retained accounts and past successful registration events."""
+    success_prefix = "注册成功:"
+    with Session(engine) as session:
+        rows = session.exec(select(RegisteredEmailHistoryModel)).all()
+        by_key = {(row.platform, row.email): row for row in rows}
+        candidates: list[tuple[str, str, datetime]] = [
+            (account.platform, account.email, account.created_at)
+            for account in session.exec(select(AccountModel)).all()
+        ]
+        # The task-event scan is only needed for the first deployment of this
+        # table.  New successful registrations are recorded directly, while
+        # retained accounts are cheap to reconcile on each startup.
+        if not rows:
+            event_rows = session.exec(
+                select(TaskEventModel, TaskModel)
+                .join(TaskModel, TaskModel.id == TaskEventModel.task_id)
+                .where(TaskModel.type == "register")
+                .where(TaskEventModel.message.startswith(success_prefix))
+            ).all()
+            candidates.extend(
+                (
+                    task.platform or "chatgpt",
+                    event.message[len(success_prefix):].strip(),
+                    event.created_at,
+                )
+                for event, task in event_rows
+            )
+
+        for platform, email, registered_at in candidates:
+            key = _normalized_history_key(platform, email)
+            if not key[0] or "@" not in key[1] or any(char.isspace() for char in key[1]):
+                continue
+            occurred_at = _normalized_utc(registered_at)
+            existing = by_key.get(key)
+            if existing:
+                existing.first_registered_at = min(
+                    _normalized_utc(existing.first_registered_at),
+                    occurred_at,
+                )
+                existing.last_registered_at = max(
+                    _normalized_utc(existing.last_registered_at),
+                    occurred_at,
+                )
+                session.add(existing)
+                continue
+            model = RegisteredEmailHistoryModel(
+                platform=key[0],
+                email=key[1],
+                first_registered_at=occurred_at,
+                last_registered_at=occurred_at,
+            )
+            session.add(model)
+            by_key[key] = model
+        session.commit()
 
 
 LEGACY_ACCOUNT_COLUMNS = (
@@ -409,6 +570,7 @@ def init_db():
     _migrate_legacy_accounts_schema()
     _ensure_column("provider_definitions", "category", "TEXT DEFAULT ''")
     SQLModel.metadata.create_all(engine)
+    _backfill_registered_email_history()
 
     with Session(engine) as session:
         ProviderDefinitionsRepository().ensure_seeded()
@@ -417,6 +579,18 @@ def init_db():
         _cleanup_empty_provider_settings()
         sync_all_account_graphs(session)
         session.commit()
+
+    from infrastructure.microsoft_mailbox_repository import (
+        migrate_legacy_microsoft_mailbox_pool,
+    )
+
+    mailbox_migration = migrate_legacy_microsoft_mailbox_pool()
+    if mailbox_migration.get("migrated"):
+        print(
+            "[DB] 已迁移微软邮箱池: "
+            f"{mailbox_migration['migrated']} 个邮箱，"
+            f"剩余 {mailbox_migration.get('remaining', 0)} 次"
+        )
 
 
 def _ensure_column(table: str, column: str, col_type: str):

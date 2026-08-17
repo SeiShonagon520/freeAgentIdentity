@@ -34,6 +34,7 @@ class AccountQuery:
     platform: str = ""
     status: str = ""
     email: str = ""
+    has_refresh_token: Optional[bool] = None
     page: int = 1
     page_size: int = 20
 
@@ -60,17 +61,6 @@ class AccountImportLine:
     email: str
     password: str
     extra: dict = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class AccountStats:
-    total: int
-    by_platform: dict[str, int]
-    by_status: dict[str, int]
-    by_lifecycle_status: dict[str, int] = field(default_factory=dict)
-    by_plan_state: dict[str, int] = field(default_factory=dict)
-    by_validity_status: dict[str, int] = field(default_factory=dict)
-    by_display_status: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

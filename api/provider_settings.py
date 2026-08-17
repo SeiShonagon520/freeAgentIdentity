@@ -90,6 +90,9 @@ def _test_mailbox(driver_type: str, extra: dict, definition) -> dict:
     try:
         mailbox = factory(extra, None)
 
+        if hasattr(mailbox, "test_connection"):
+            mailbox.test_connection()
+
         if hasattr(mailbox, "peek_email"):
             email = mailbox.peek_email()
             return {

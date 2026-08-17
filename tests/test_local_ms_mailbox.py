@@ -64,6 +64,8 @@ def test_local_ms_pool_records_gujumpgate_source_metadata(tmp_path):
 
 
 def test_local_ms_pool_allocates_six_outlook_child_addresses_per_parent(tmp_path):
+    import re
+
     pool = LocalMicrosoftMailboxPool(
         pool_text="parent@outlook.com----mail-pass----client-id----refresh-token",
         state_file=str(tmp_path / "state.json"),
@@ -72,11 +74,13 @@ def test_local_ms_pool_allocates_six_outlook_child_addresses_per_parent(tmp_path
 
     accounts = [pool.get_email() for _ in range(6)]
 
-    assert [item.email for item in accounts] == [
-        f"parent+reg{index}@outlook.com" for index in range(1, 7)
-    ]
+    # Every use is an isolated random sub-address (parent+<6-char-tag>@outlook.com)
+    # that delivers into the parent inbox.  The bare parent is never handed out:
+    # a shared parent inbox lets one worker read another's (or a stale) OTP.
+    assert all(re.fullmatch(r"parent\+[a-z0-9]{6}@outlook.com", item.email) for item in accounts)
     assert {item.account_id for item in accounts} == {
-        f"parent@outlook.com#sub-{index}" for index in range(1, 7)
+        "parent@outlook.com#sub-1",
+        *(f"parent@outlook.com#sub-{i}" for i in range(2, 7)),
     }
     assert all(
         item.extra["provider_account"]["credentials"]["email"] == "parent@outlook.com"
@@ -92,7 +96,26 @@ def test_local_ms_pool_allocates_six_outlook_child_addresses_per_parent(tmp_path
     except RuntimeError as exc:
         assert "已用尽" in str(exc)
     else:
-        raise AssertionError("the seventh child address should not be allocated")
+        raise AssertionError("the seventh use should not be allocated")
+
+
+def test_local_ms_pool_defaults_to_six_children_and_excludes_exhausted_parent(tmp_path):
+    import re
+
+    pool = LocalMicrosoftMailboxPool(
+        pool_text="parent@outlook.com----mail-pass----client-id----refresh-token",
+        state_file=str(tmp_path / "state.json"),
+    )
+
+    emails = [pool.get_email().email for _ in range(6)]
+    # All six uses are isolated +tag sub-addresses; the bare parent is never used.
+    assert all(re.fullmatch(r"parent\+[a-z0-9]{6}@outlook.com", email) for email in emails)
+    try:
+        pool.peek_email()
+    except RuntimeError as exc:
+        assert "已用尽" in str(exc)
+    else:
+        raise AssertionError("an exhausted Microsoft parent mailbox must leave the pool")
 
 
 def test_child_mailbox_otp_filter_matches_only_the_assigned_recipient():
@@ -147,3 +170,33 @@ def test_graph_access_token_tries_fallback_endpoint(monkeypatch):
     assert len(calls) == 2
     assert calls[0][0] == "https://login.microsoftonline.com/common/oauth2/v2.0/token"
     assert calls[1][0] == "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+
+
+def test_graph_invalid_grant_disables_parent_mailbox(monkeypatch):
+    class FakeResponse:
+        status_code = 400
+        text = '{"error":"invalid_grant"}'
+
+        def json(self):
+            return {"error": "invalid_grant"}
+
+    monkeypatch.setattr(
+        "core.local_ms_mailbox.requests.post",
+        lambda *_args, **_kwargs: FakeResponse(),
+    )
+    pool = LocalMicrosoftMailboxPool(
+        pool_text="dead@outlook.com----mail-pass----client-id----dead-refresh-token"
+    )
+    account = pool.get_email()
+    entry = pool._entry_for_account(account)
+
+    try:
+        pool._graph_access_token(entry)
+    except RuntimeError as exc:
+        assert "已失效" in str(exc)
+    else:
+        raise AssertionError("invalid_grant must fail token exchange")
+
+    record = pool._repository().get_by_parent_email("dead@outlook.com")
+    assert record is not None
+    assert record.status == "disabled"

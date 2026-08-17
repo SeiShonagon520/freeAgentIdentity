@@ -19,10 +19,13 @@ class TaskSummary:
     platform: str
     status: str
     progress: TaskProgress
+    terminal: bool = False
+    cancellable: bool = False
     success: int = 0
     error_count: int = 0
     errors: list[str] = field(default_factory=list)
     cashier_urls: list[str] = field(default_factory=list)
+    data: Any = None
     error: str = ""
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None

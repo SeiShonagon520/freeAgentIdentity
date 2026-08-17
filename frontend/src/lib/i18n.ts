@@ -51,6 +51,7 @@ const ZH_MESSAGES = {
   "nav.settings": "设置",
   "nav.settings.general": "通用",
   "nav.settings.mailbox": "邮箱服务",
+  "nav.settings.proxyPool": "Mihomo 代理池",
   "sidebar.theme.light": "浅色",
   "sidebar.theme.dark": "深色",
   "sidebar.theme.system": "系统",
@@ -85,6 +86,7 @@ const ZH_MESSAGES = {
   "settings.title.general": "通用设置",
   "settings.title.register": "注册策略",
   "settings.title.mailbox": "邮箱服务",
+  "settings.title.proxyPool": "Mihomo 代理池",
   "settings.title.captcha": "验证服务",
   "settings.title.proxies": "代理资源",
   "settings.title.chatgpt": "ChatGPT",
@@ -115,10 +117,6 @@ const ZH_MESSAGES = {
   "settings.license": "开源协议",
   "settings.qqGroup": "QQ群 + 教程",
   "settings.qqGroup.join": "点击加入",
-  "welcome.title": "欢迎使用 aBaiAutoplus",
-  "welcome.desc": "扫码或点击下方链接加入 QQ 群，获取使用教程与最新动态。",
-  "welcome.join": "加入 QQ 群 + 教程",
-  "welcome.close": "我知道了",
   "settings.versionInfo": "版本信息",
   "settings.versionInfo.desc": "当前应用版本与更新检测。",
   "settings.configuration": "配置",
@@ -127,7 +125,7 @@ const ZH_MESSAGES = {
   "settings.registerHelp":
     "普通使用者只需要理解两件事：注册身份选“系统邮箱”还是“第三方账号”，执行方式选“协议模式 / 后台浏览器自动 / 可视浏览器自动”。这里的配置只是设置默认值。",
   "settings.provider.mailboxUsage":
-    "只有在注册身份选择“系统邮箱”时，才会使用这里的邮箱服务配置。列表行内可以直接查看详情、编辑、设默认和删除。",
+    "在这里启用并配置邮箱服务；创建注册任务时，需要在注册弹窗中手动选择本次使用的邮箱服务。",
   "settings.provider.captchaUsage":
     "协议模式会按已启用顺序自动选择远程打码服务；浏览器模式使用当前默认的验证码 provider。列表行内可以直接查看详情、编辑、设默认、删除。",
   "settings.chatgpt.cpaDesc": "注册完成后自动上传到 CPA 管理平台",
@@ -278,14 +276,10 @@ const ZH_MESSAGES = {
   "accounts.verificationSummary": "验证策略",
   "accounts.missingDefaultMailbox":
     "未配置默认邮箱 provider，请先到设置页启用一个邮箱 provider",
-  "accounts.outlookPoolLabel": "Outlook 账号池（协议注册）",
-  "accounts.outlookPoolHint":
-    "支持两种格式：① 邮箱----密码----Client ID----Refresh Token；② Xinlan/BH Mailer common 19 列格式。每行一个账号。",
-  "accounts.outlookPoolPlaceholder":
-    "account@outlook.com----邮箱密码----client_id----refresh_token\n或粘贴 Xinlan/BH Mailer common 19 列账号",
-  "accounts.outlookPoolRequired": "协议注册必须填写 Outlook 账号池",
-  "accounts.outlookAliasHint": "每个 Outlook 母邮箱自动分配 6 个 +reg 子邮箱，并按收件人隔离验证码。",
-  "accounts.protocolVerificationSummary": "内置 Sentinel + Outlook 邮箱 OTP",
+  "accounts.mailboxServiceLabel": "验证码邮箱服务",
+  "accounts.mailboxServiceHint": "协议注册、后台浏览器和可见浏览器均使用这里选择的邮箱服务。可在设置页新增和配置自有域名邮箱。",
+  "accounts.domainMailboxHint": "请确认域名邮局已将未知收件人（全收 / catch-all）投递到该 IMAP 收件箱。",
+  "accounts.protocolVerificationSummary": "内置 Sentinel + 所选邮箱服务 OTP",
   "accounts.autoUploadSub2Api": "注册成功后上传 Agent Identity 到 Sub2API",
   "accounts.autoUploadSub2ApiHint":
     "每个账号注册成功后立即上传；使用 Sub2API Admin API Key，不会保存到任务或本地配置。",
@@ -444,6 +438,7 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "nav.settings": "Settings",
   "nav.settings.general": "General",
   "nav.settings.mailbox": "Mailbox",
+  "nav.settings.proxyPool": "Mihomo Proxy Pool",
   "sidebar.theme.light": "Light",
   "sidebar.theme.dark": "Dark",
   "sidebar.theme.system": "System",
@@ -478,6 +473,7 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "settings.title.general": "General Settings",
   "settings.title.register": "Registration",
   "settings.title.mailbox": "Mailbox Services",
+  "settings.title.proxyPool": "Mihomo Proxy Pool",
   "settings.title.captcha": "Captcha Services",
   "settings.title.proxies": "Proxy Resources",
   "settings.title.chatgpt": "ChatGPT",
@@ -508,10 +504,6 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "settings.license": "License",
   "settings.qqGroup": "QQ Group + Tutorial",
   "settings.qqGroup.join": "Click to join",
-  "welcome.title": "Welcome to aBaiAutoplus",
-  "welcome.desc": "Scan the QR code or click the link below to join the QQ group for tutorials and updates.",
-  "welcome.join": "Join QQ Group + Tutorial",
-  "welcome.close": "Got it",
   "settings.versionInfo": "Version Info",
   "settings.versionInfo.desc": "Current application version and update checks.",
   "settings.configuration": "Configuration",
@@ -520,7 +512,7 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "settings.registerHelp":
     "Most users only need to choose between “System Mailbox” and “OAuth Account”, then choose Protocol, Background Browser, or Visible Browser. These settings only define the defaults.",
   "settings.provider.mailboxUsage":
-    "Mailbox services are used only when the registration identity is “System Mailbox”. Rows support details, editing, default selection, and deletion.",
+    "Enable and configure mailbox services here, then manually choose one in the registration dialog for each task.",
   "settings.provider.captchaUsage":
     "Protocol mode selects remote captcha services in enabled order; browser mode uses the current default captcha provider. Rows support details, editing, default selection, and deletion.",
   "settings.chatgpt.cpaDesc":
@@ -681,14 +673,10 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "accounts.verificationSummary": "Verification Strategy",
   "accounts.missingDefaultMailbox":
     "No default mailbox provider is configured. Enable one in Settings first.",
-  "accounts.outlookPoolLabel": "Outlook Account Pool (Protocol)",
-  "accounts.outlookPoolHint":
-    "Supports two formats: email----password----client ID----refresh token, or the 19-column Xinlan/BH Mailer common format. One account per line.",
-  "accounts.outlookPoolPlaceholder":
-    "account@outlook.com----mail password----client_id----refresh_token\nor paste a 19-column Xinlan/BH Mailer common row",
-  "accounts.outlookPoolRequired": "Outlook account pool is required for protocol registration",
-  "accounts.outlookAliasHint": "Each parent Outlook inbox is assigned six +reg child addresses, with OTPs isolated by recipient.",
-  "accounts.protocolVerificationSummary": "Built-in Sentinel + Outlook email OTP",
+  "accounts.mailboxServiceLabel": "Verification mailbox service",
+  "accounts.mailboxServiceHint": "Protocol, background-browser, and visible-browser registrations use the selected service. Add and configure a domain mailbox in Settings.",
+  "accounts.domainMailboxHint": "Make sure the mail server delivers unknown recipients (catch-all) to this IMAP inbox.",
+  "accounts.protocolVerificationSummary": "Built-in Sentinel + selected mailbox OTP",
   "accounts.autoUploadSub2Api": "Upload Agent Identity to Sub2API after registration",
   "accounts.autoUploadSub2ApiHint":
     "Uploads each account immediately after it registers successfully using a Sub2API Admin API Key; it is never saved to the task or local settings.",

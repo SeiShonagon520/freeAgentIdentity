@@ -8,9 +8,7 @@ def test_list_platforms(client):
     data = resp.json()
     assert isinstance(data, list)
     names = [p["name"] for p in data]
-    # At least the core platforms should be loaded
-    assert "chatgpt" in names
-    assert "cursor" in names
+    assert names == ["chatgpt"]
 
 
 def test_platform_has_required_fields(client):
@@ -27,4 +25,4 @@ def test_platform_has_required_fields(client):
 def test_chatgpt_exposes_protocol_registration(client):
     platforms = client.get("/api/platforms").json()
     chatgpt = next(item for item in platforms if item["name"] == "chatgpt")
-    assert "protocol" in chatgpt["supported_executors"]
+    assert chatgpt["supported_executors"] == ["protocol", "headless", "headed"]

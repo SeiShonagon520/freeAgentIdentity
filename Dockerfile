@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # noVNC 依赖
     novnc websockify \
     # 其他
-    curl ca-certificates fonts-liberation libnss3 libatk-bridge2.0-0 \
+    curl ca-certificates nodejs fonts-liberation libnss3 libatk-bridge2.0-0 \
     libdrm2 libxcomposite1 libxdamage1 libxrandr2 libgbm1 libxkbcommon0 \
     libasound2 libpango-1.0-0 libcairo2 libgtk-3-0 \
     && rm -rf /var/lib/apt/lists/*
@@ -39,6 +39,8 @@ RUN python -m camoufox fetch
 # 复制后端代码
 ARG APP_VERSION=dev
 COPY . .
+RUN find . -type d -name __pycache__ -prune -exec rm -rf {} + \
+    && find . -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 # 注入版本号
 RUN echo "__version__ = \"${APP_VERSION}\"" > core/version.py
 # 不需要 .venv 和 frontend 源码
@@ -49,7 +51,7 @@ COPY --from=frontend-builder /app/static ./static
 
 # 启动脚本
 COPY docker-entrypoint.sh /docker-entrypoint.sh
-RUN chmod +x /docker-entrypoint.sh
+RUN sed -i 's/\r$//' /docker-entrypoint.sh && chmod +x /docker-entrypoint.sh
 
 # APP_PASSWORD: 运行时通过 -e APP_PASSWORD=xxx 设置
 # 不设置则无密码保护（适用于本地使用）

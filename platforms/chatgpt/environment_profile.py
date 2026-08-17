@@ -26,6 +26,10 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 
 
+PROTOCOL_CHROME_VERSION = "146"
+PROTOCOL_CHROME_IMPERSONATE = f"chrome{PROTOCOL_CHROME_VERSION}"
+
+
 # ---------------------------------------------------------------------------
 # Family helpers
 # ---------------------------------------------------------------------------
@@ -117,7 +121,8 @@ class ProtocolEnvironmentProfile:
         "chrome99", "chrome100", "chrome101", "chrome104", "chrome107",
         "chrome110", "chrome116", "chrome119", "chrome120", "chrome123",
         "chrome124", "chrome126", "chrome127", "chrome128", "chrome129",
-        "chrome130", "chrome131",
+        "chrome130", "chrome131", "chrome133a", "chrome136", "chrome142",
+        "chrome145", "chrome146",
         "firefox102", "firefox110", "firefox117", "firefox128",
         "firefox133", "firefox135", "firefox144",
         "safari15_5", "safari17_0", "safari18_0",
@@ -175,14 +180,14 @@ class ProtocolEnvironmentProfile:
 
     @classmethod
     def desktop_us_en_chrome_v1(cls) -> ProtocolEnvironmentProfile:
-        """Windows 10 desktop, Chrome 131, English (US), 1920×1080, 8 cores."""
+        """Windows desktop, current Chrome, English (US), 1920×1080, 8 cores."""
         return cls(
             name="desktop-us-en-chrome-v1",
-            impersonate="chrome131",
+            impersonate=PROTOCOL_CHROME_IMPERSONATE,
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
+                f"Chrome/{PROTOCOL_CHROME_VERSION}.0.0.0 Safari/537.36"
             ),
             accept_language="en-US,en;q=0.9",
             language="en-US",
@@ -197,14 +202,14 @@ class ProtocolEnvironmentProfile:
 
     @classmethod
     def desktop_us_en_chrome_v2(cls) -> ProtocolEnvironmentProfile:
-        """Windows 10 desktop, Chrome 131, English (US), 2560×1440, 16 cores."""
+        """Windows desktop, current Chrome, English (US), 2560×1440, 16 cores."""
         return cls(
             name="desktop-us-en-chrome-v2",
-            impersonate="chrome131",
+            impersonate=PROTOCOL_CHROME_IMPERSONATE,
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
+                f"Chrome/{PROTOCOL_CHROME_VERSION}.0.0.0 Safari/537.36"
             ),
             accept_language="en-US,en;q=0.9",
             language="en-US",
@@ -219,14 +224,14 @@ class ProtocolEnvironmentProfile:
 
     @classmethod
     def desktop_us_en_chrome_v3(cls) -> ProtocolEnvironmentProfile:
-        """macOS desktop, Chrome 131, English (US), 1680×1050, 10 cores."""
+        """macOS desktop, current Chrome, English (US), 1680×1050, 10 cores."""
         return cls(
             name="desktop-us-en-chrome-v3",
-            impersonate="chrome131",
+            impersonate=PROTOCOL_CHROME_IMPERSONATE,
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
+                f"Chrome/{PROTOCOL_CHROME_VERSION}.0.0.0 Safari/537.36"
             ),
             accept_language="en-US,en;q=0.9",
             language="en-US",
@@ -241,14 +246,14 @@ class ProtocolEnvironmentProfile:
 
     @classmethod
     def desktop_us_en_chrome_v4(cls) -> ProtocolEnvironmentProfile:
-        """Windows 10 desktop, Chrome 131, English (US), 1366×768, 4 cores (laptop)."""
+        """Windows laptop, current Chrome, English (US), 1366×768, 4 cores."""
         return cls(
             name="desktop-us-en-chrome-v4",
-            impersonate="chrome131",
+            impersonate=PROTOCOL_CHROME_IMPERSONATE,
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
+                f"Chrome/{PROTOCOL_CHROME_VERSION}.0.0.0 Safari/537.36"
             ),
             accept_language="en-US,en;q=0.9",
             language="en-US",
@@ -263,14 +268,14 @@ class ProtocolEnvironmentProfile:
 
     @classmethod
     def desktop_us_en_chrome_v5(cls) -> ProtocolEnvironmentProfile:
-        """Windows 10 desktop, Chrome 131, English (US), 1440×900, 6 cores."""
+        """Windows desktop, current Chrome, English (US), 1440×900, 6 cores."""
         return cls(
             name="desktop-us-en-chrome-v5",
-            impersonate="chrome131",
+            impersonate=PROTOCOL_CHROME_IMPERSONATE,
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
+                f"Chrome/{PROTOCOL_CHROME_VERSION}.0.0.0 Safari/537.36"
             ),
             accept_language="en-US,en;q=0.9",
             language="en-US",
@@ -285,14 +290,14 @@ class ProtocolEnvironmentProfile:
 
     @classmethod
     def desktop_us_en_chrome_v6(cls) -> ProtocolEnvironmentProfile:
-        """Linux desktop, Chrome 131, English (US), 1920×1080, 12 cores."""
+        """Linux desktop, current Chrome, English (US), 1920×1080, 12 cores."""
         return cls(
             name="desktop-us-en-chrome-v6",
-            impersonate="chrome131",
+            impersonate=PROTOCOL_CHROME_IMPERSONATE,
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
+                f"Chrome/{PROTOCOL_CHROME_VERSION}.0.0.0 Safari/537.36"
             ),
             accept_language="en-US,en;q=0.9",
             language="en-US",
@@ -307,18 +312,19 @@ class ProtocolEnvironmentProfile:
 
     @classmethod
     def desktop_us_en_firefox_v1(cls) -> ProtocolEnvironmentProfile:
-        """Windows 10 desktop, Firefox 135, English (US), 1920×1080, 8 cores.
+        """Windows 10 desktop, Firefox 144, English (US), 1920×1080, 8 cores.
 
-        This is the correct profile for the existing ``firefox144``
-        impersonation target.  Use this only if you intentionally want a
-        Firefox TLS fingerprint.
+        The ``firefox144`` curl_cffi impersonation target provides a Firefox
+        TLS/HTTP2 fingerprint that Cloudflare does NOT challenge on ChatGPT's
+        edge, unlike the Chrome impersonation (HTTP 403).  The UA string is kept
+        consistent with the impersonated Firefox version.
         """
         return cls(
             name="desktop-us-en-firefox-v1",
             impersonate="firefox144",
             user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) "
-                "Gecko/20100101 Firefox/135.0"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
+                "Gecko/20100101 Firefox/144.0"
             ),
             accept_language="en-US,en;q=0.9",
             language="en-US",
@@ -333,8 +339,14 @@ class ProtocolEnvironmentProfile:
 
     @classmethod
     def all_us_en_desktop_variants(cls) -> list[ProtocolEnvironmentProfile]:
-        """Return every US-English desktop profile for fingerprint rotation."""
+        """Return every US-English desktop profile for fingerprint rotation.
+
+        Firefox variants come first: curl_cffi's Chrome impersonation is flagged
+        by Cloudflare on ChatGPT's edge (HTTP 403 challenge) while the Firefox
+        TLS/HTTP2 fingerprint passes, so the pool prefers Firefox.
+        """
         return [
+            cls.desktop_us_en_firefox_v1(),
             cls.desktop_us_en_chrome_v1(),
             cls.desktop_us_en_chrome_v2(),
             cls.desktop_us_en_chrome_v3(),
@@ -347,11 +359,10 @@ class ProtocolEnvironmentProfile:
     def default(cls) -> ProtocolEnvironmentProfile:
         """The recommended default for new deployments.
 
-        Uses Chrome 131 (a well-supported curl_cffi target) with a
-        matching Chrome UA string.  This replaces the old ``firefox144``
-        + Chrome UA contradiction.
+        Uses the Firefox TLS/HTTP2 fingerprint which passes Cloudflare's
+        ChatGPT edge (Chrome impersonation is challenged with HTTP 403).
         """
-        return cls.desktop_us_en_chrome_v1()
+        return cls.desktop_us_en_firefox_v1()
 
 
 # ---------------------------------------------------------------------------

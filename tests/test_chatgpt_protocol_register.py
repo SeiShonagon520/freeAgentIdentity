@@ -1,12 +1,27 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 import types
+from urllib.parse import parse_qs, urlparse
 
 import pytest
+from curl_cffi import CurlECode, CurlError
 import platforms.chatgpt.protocol_register as protocol_register
-from platforms.chatgpt.constants import CHATGPT_APP, OPENAI_API_ENDPOINTS, SENTINEL_REQ_URL
+from platforms.chatgpt.constants import (
+    CHATGPT_APP,
+    CODEX_CLIENT_ID,
+    OPENAI_API_ENDPOINTS,
+    OPENAI_AUTH,
+    OAUTH_TOKEN_URL,
+    SENTINEL_REQ_URL,
+)
+from platforms.chatgpt.environment_profile import (
+    FingerprintPool,
+    PROTOCOL_CHROME_IMPERSONATE,
+    PROTOCOL_CHROME_VERSION,
+)
 from platforms.chatgpt.plugin import ChatGPTPlatform
 from platforms.chatgpt.protocol_register import (
     ChatGPTProtocolRegister,
@@ -23,14 +38,23 @@ class _FakeCookies:
 
 
 class _FakeResponse:
-    def __init__(self, status_code=200, payload=None, *, headers=None, text=""):
+    def __init__(self, status_code=200, payload=None, *, headers=None, text="", url=""):
         self.status_code = status_code
         self._payload = payload if payload is not None else {}
         self.headers = headers or {}
         self.text = text
+        self.url = url
 
     def json(self):
         return self._payload
+
+
+def _fake_jwt(payload: dict) -> str:
+    header = base64.urlsafe_b64encode(b'{"alg":"none"}').decode("ascii").rstrip("=")
+    body = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"{header}.{body}.signature"
 
 
 class _FakeSession:
@@ -40,10 +64,23 @@ class _FakeSession:
         self.create_headers = {}
         self.create_body = {}
         self.password_body = {}
+        self.signup_body = {}
+        self.signup_headers = {}
+        self.oauth_state = ""
+        self.current_email = ""
+        self.send_otp_calls = 0
         self.closed = False
 
     def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
+        if url.startswith(f"{OPENAI_AUTH}/oauth/authorize?"):
+            self.oauth_state = str(
+                (parse_qs(urlparse(url).query).get("state") or [""])[0]
+            )
+            return _FakeResponse(url=f"{OPENAI_AUTH}/create-account")
+        if url == OPENAI_API_ENDPOINTS["send_otp"]:
+            self.send_otp_calls += 1
+            return _FakeResponse(payload={"ok": True}, url=url)
         if url == f"{CHATGPT_APP}/api/auth/csrf":
             return _FakeResponse(payload={"csrfToken": "csrf-token"})
         if url == "https://auth.openai.com/authorize-start":
@@ -63,9 +100,21 @@ class _FakeSession:
         self.calls.append(("POST", url, kwargs))
         if url.startswith(f"{CHATGPT_APP}/api/auth/signin/openai?"):
             return _FakeResponse(payload={"url": "https://auth.openai.com/authorize-start"})
+        if url == OPENAI_API_ENDPOINTS["signup"]:
+            self.signup_body = kwargs["json"]
+            self.signup_headers = kwargs["headers"]
+            self.current_email = str(kwargs["json"]["username"]["value"])
+            return _FakeResponse(
+                payload={
+                    "continue_url": "/create-account/password",
+                    "page": {"type": "create_account_password"},
+                }
+            )
         if url == OPENAI_API_ENDPOINTS["validate_otp"]:
             assert kwargs["json"] == {"code": "123456"}
-            return _FakeResponse(payload={"continue_url": "/create-account/password"})
+            return _FakeResponse(
+                payload={"continue_url": "/about-you", "page": {"type": "about_you"}}
+            )
         if url == SENTINEL_REQ_URL:
             request_payload = json.loads(kwargs["data"])
             return _FakeResponse(
@@ -80,19 +129,62 @@ class _FakeSession:
             self.create_body = kwargs["json"]
             return _FakeResponse(
                 payload={
-                    "continue_url": f"{CHATGPT_APP}/api/auth/callback/openai?code=ok&state=test"
+                    "continue_url": (
+                        "http://localhost:1455/auth/callback?code=ok"
+                        f"&state={self.oauth_state}"
+                    )
                 }
             )
         if url == OPENAI_API_ENDPOINTS["register"]:
             self.password_body = kwargs["json"]
-            return _FakeResponse(payload={"continue_url": "/about-you"})
+            return _FakeResponse(
+                payload={
+                    "continue_url": "/email-verification",
+                    "page": {"type": "email_otp_verification"},
+                }
+            )
+        if url == OAUTH_TOKEN_URL:
+            assert kwargs["data"]["client_id"] == CODEX_CLIENT_ID
+            return _FakeResponse(
+                payload={
+                    "access_token": "codex-access",
+                    "refresh_token": "codex-refresh",
+                    "id_token": _fake_jwt(
+                        {
+                            "email": self.current_email,
+                            "https://api.openai.com/auth": {
+                                "chatgpt_account_id": "account-123",
+                                "organization_id": "workspace-123",
+                            },
+                        }
+                    ),
+                    "expires_in": 3600,
+                }
+            )
         raise AssertionError(f"unexpected POST {url}")
 
     def close(self):
         self.closed = True
 
 
-def test_protocol_register_completes_email_flow_without_browser():
+def _install_valid_web_session_mint(monkeypatch):
+    monkeypatch.setattr(
+        "platforms.chatgpt.credential_checks.mint_chatgpt_refresh_token_from_session",
+        lambda *_args, **_kwargs: {
+            "state": "valid",
+            "message": "web session exchanged",
+            "tokens": {
+                "access_token": "web-codex-access",
+                "refresh_token": "web-codex-refresh",
+                "id_token": "web-codex-id",
+                "client_id": CODEX_CLIENT_ID,
+            },
+        },
+    )
+
+
+def test_protocol_register_completes_email_flow_without_browser(monkeypatch):
+    _install_valid_web_session_mint(monkeypatch)
     session = _FakeSession()
     logs = []
     worker = ChatGPTProtocolRegister(
@@ -105,35 +197,214 @@ def test_protocol_register_completes_email_flow_without_browser():
 
     assert result["email"] == "user@outlook.com"
     assert result["password"] == "StrongPass123!"
-    assert result["access_token"] == "header.payload.signature"
+    assert result["access_token"] == "web-codex-access"
+    assert result["refresh_token"] == "web-codex-refresh"
+    assert result["client_id"] == CODEX_CLIENT_ID
     assert result["session_token"] == "session-token"
     assert result["account_id"] == "account-123"
+    assert result["workspace_id"] == "account-123"
     assert session.password_body == {
         "username": "user@outlook.com",
         "password": "StrongPass123!",
     }
+    assert session.signup_body == {
+        "username": {"value": "user@outlook.com", "kind": "email"},
+        "screen_hint": "signup",
+    }
+    signup_sentinel = json.loads(session.signup_headers["openai-sentinel-token"])
+    assert signup_sentinel["flow"] == "authorize_continue"
+    assert any(url == CHATGPT_APP for method, url, _kwargs in session.calls if method == "GET")
+    assert session.send_otp_calls == 0
+    register_index = next(
+        index for index, (method, url, _kwargs) in enumerate(session.calls)
+        if method == "POST" and url == OPENAI_API_ENDPOINTS["register"]
+    )
+    validate_index = next(
+        index for index, (method, url, _kwargs) in enumerate(session.calls)
+        if method == "POST" and url == OPENAI_API_ENDPOINTS["validate_otp"]
+    )
+    create_index = next(
+        index for index, (method, url, _kwargs) in enumerate(session.calls)
+        if method == "POST" and url == OPENAI_API_ENDPOINTS["create_account"]
+    )
+    assert register_index < validate_index < create_index
     assert "first_name" not in session.create_body
     assert session.closed is True
     sentinel = json.loads(session.create_headers["openai-sentinel-token"])
     assert sentinel["flow"] == "oauth_create_account"
     assert sentinel["c"] == "challenge-token"
-    assert any("协议注册完成" in line for line in logs)
+    assert any("ChatGPT Web 协议注册" in line for line in logs)
 
 
-def test_protocol_register_adds_codex_refresh_token_to_result(monkeypatch):
+def test_protocol_register_accepts_otp_first_authorization_state(monkeypatch):
+    _install_valid_web_session_mint(monkeypatch)
+    class OtpFirstSession(_FakeSession):
+        def post(self, url, **kwargs):
+            if url == OPENAI_API_ENDPOINTS["signup"]:
+                self.calls.append(("POST", url, kwargs))
+                self.signup_body = kwargs["json"]
+                self.signup_headers = kwargs["headers"]
+                self.current_email = str(kwargs["json"]["username"]["value"])
+                return _FakeResponse(
+                    payload={
+                        "continue_url": "/email-verification",
+                        "page": {"type": "email_otp_verification"},
+                    }
+                )
+            if url == OPENAI_API_ENDPOINTS["validate_otp"]:
+                self.calls.append(("POST", url, kwargs))
+                return _FakeResponse(
+                    payload={
+                        "continue_url": "/create-account/password",
+                        "page": {"type": "create_account_password"},
+                    }
+                )
+            if url == OPENAI_API_ENDPOINTS["register"]:
+                self.calls.append(("POST", url, kwargs))
+                self.password_body = kwargs["json"]
+                return _FakeResponse(
+                    payload={"continue_url": "/about-you", "page": {"type": "about_you"}}
+                )
+            return super().post(url, **kwargs)
+
+    session = OtpFirstSession()
+    worker = ChatGPTProtocolRegister(
+        session=session,
+        otp_callback=lambda: "123456",
+    )
+
+    result = worker.run(email="otp-first@example.com", password="StrongPass123!")
+
+    assert result["refresh_token"] == "web-codex-refresh"
+    validate_index = next(
+        index for index, (method, url, _kwargs) in enumerate(session.calls)
+        if method == "POST" and url == OPENAI_API_ENDPOINTS["validate_otp"]
+    )
+    register_index = next(
+        index for index, (method, url, _kwargs) in enumerate(session.calls)
+        if method == "POST" and url == OPENAI_API_ENDPOINTS["register"]
+    )
+    assert validate_index < register_index
+
+
+def test_protocol_register_lets_create_account_decide_after_add_phone_hint():
+    class AddPhoneHintSession(_FakeSession):
+        def post(self, url, **kwargs):
+            if url == OPENAI_API_ENDPOINTS["validate_otp"]:
+                self.calls.append(("POST", url, kwargs))
+                return _FakeResponse(
+                    payload={
+                        "continue_url": "/add-phone",
+                        "page": {"type": "add_phone"},
+                    }
+                )
+            return super().post(url, **kwargs)
+
+    session = AddPhoneHintSession()
+    logs = []
+    worker = ChatGPTProtocolRegister(
+        session=session,
+        otp_callback=lambda: "123456",
+        log_fn=logs.append,
+    )
+
+    result = worker._run_codex_registration(
+        email="phone-hint@example.com",
+        password="StrongPass123!",
+    )
+
+    assert result["access_token"] == "codex-access"
+    assert result["refresh_token"] == "codex-refresh"
+    assert any(
+        method == "POST" and url == OPENAI_API_ENDPOINTS["create_account"]
+        for method, url, _kwargs in session.calls
+    )
+    assert any("create_account" in message for message in logs)
+
+
+def test_protocol_register_uses_web_registration_before_codex_token_mint(monkeypatch):
+    class DirectBootstrapFailureSession(_FakeSession):
+        def get(self, url, **kwargs):
+            if url.startswith(f"{OPENAI_AUTH}/oauth/authorize?"):
+                self.calls.append(("GET", url, kwargs))
+                return _FakeResponse(status_code=500, text="direct oauth unavailable", url=url)
+            return super().get(url, **kwargs)
+
     monkeypatch.setattr(
         "platforms.chatgpt.credential_checks.mint_chatgpt_refresh_token_from_session",
         lambda *_args, **_kwargs: {
             "state": "valid",
-            "message": "OAuth RT ready",
+            "message": "legacy web session exchanged",
             "tokens": {
-                "access_token": "codex-access",
-                "refresh_token": "codex-refresh",
-                "id_token": "codex-id",
-                "client_id": "codex-client",
+                "access_token": "legacy-access",
+                "refresh_token": "legacy-refresh",
+                "id_token": "legacy-id",
+                "client_id": CODEX_CLIENT_ID,
             },
         },
     )
+    session = DirectBootstrapFailureSession()
+    logs = []
+    worker = ChatGPTProtocolRegister(
+        session=session,
+        otp_callback=lambda: "123456",
+        log_fn=logs.append,
+    )
+
+    result = worker.run(email="fallback@example.com", password="StrongPass123!")
+
+    assert result["refresh_token"] == "legacy-refresh"
+    assert any(
+        method == "POST" and url.startswith(f"{CHATGPT_APP}/api/auth/signin/openai?")
+        for method, url, _kwargs in session.calls
+    )
+    assert not any(
+        method == "GET" and url.startswith(f"{OPENAI_AUTH}/oauth/authorize?")
+        for method, url, _kwargs in session.calls
+    )
+    assert any("ChatGPT Web 协议注册" in message for message in logs)
+
+
+def test_protocol_register_reports_oauth_error_redirect_without_waiting_for_otp():
+    encoded_error = base64.urlsafe_b64encode(
+        json.dumps({"errorCode": "rate_limit_exceeded"}).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    error_url = f"https://auth.openai.com/error?payload={encoded_error}"
+
+    class ErrorSession:
+        cookies = _FakeCookies()
+
+        @staticmethod
+        def get(url, **_kwargs):
+            if url == f"{CHATGPT_APP}/api/auth/csrf":
+                return _FakeResponse(payload={"csrfToken": "csrf-token"}, url=url)
+            if url == "https://auth.openai.com/authorize-start":
+                return _FakeResponse(
+                    status_code=302,
+                    headers={"location": error_url},
+                    url=url,
+                )
+            if url == error_url:
+                return _FakeResponse(url=error_url, text="OpenAI error")
+            return _FakeResponse(url=url)
+
+        @staticmethod
+        def post(url, **_kwargs):
+            if url.startswith(f"{CHATGPT_APP}/api/auth/signin/openai?"):
+                return _FakeResponse(
+                    payload={"url": "https://auth.openai.com/authorize-start"},
+                    url=url,
+                )
+            raise AssertionError(f"unexpected POST {url}")
+
+    worker = ChatGPTProtocolRegister(session=ErrorSession())
+
+    with pytest.raises(RuntimeError, match="rate_limit_exceeded"):
+        worker._initialize_signup("user@example.com")
+
+
+def test_protocol_register_adds_codex_refresh_token_to_result(monkeypatch):
+    _install_valid_web_session_mint(monkeypatch)
     session = _FakeSession()
     worker = ChatGPTProtocolRegister(
         session=session,
@@ -142,13 +413,40 @@ def test_protocol_register_adds_codex_refresh_token_to_result(monkeypatch):
 
     result = worker.run(email="rt@example.com", password="StrongPass123!")
 
-    assert result["access_token"] == "codex-access"
-    assert result["refresh_token"] == "codex-refresh"
-    assert result["id_token"] == "codex-id"
-    assert result["client_id"] == "codex-client"
+    assert result["access_token"] == "web-codex-access"
+    assert result["refresh_token"] == "web-codex-refresh"
+    assert result["id_token"]
+    assert result["client_id"] == CODEX_CLIENT_ID
 
 
-def test_protocol_register_profile_request_uses_only_supported_fields():
+def test_protocol_register_treats_add_phone_as_normal_no_rt(monkeypatch):
+    monkeypatch.setattr(
+        "platforms.chatgpt.credential_checks.mint_chatgpt_refresh_token_from_session",
+        lambda *_args, **_kwargs: {
+            "state": "unknown",
+            "message": "Codex OAuth 要求手机号验证，本次 RT 获取失败（未执行短信接码）",
+            "tokens": {},
+        },
+    )
+    logs = []
+    worker = ChatGPTProtocolRegister(
+        session=_FakeSession(),
+        otp_callback=lambda: "123456",
+        log_fn=logs.append,
+    )
+
+    result = worker.run(email="phone-gated@example.com", password="StrongPass123!")
+
+    assert result["access_token"] == "header.payload.signature"
+    assert result["refresh_token"] == ""
+    assert result["id_token"] == ""
+    assert result["client_id"] == ""
+    assert any("命中 add_phone，按正常无 RT 账号保存" in message for message in logs)
+    assert any("正常无 RT 状态" in message for message in logs)
+
+
+def test_protocol_register_profile_request_uses_only_supported_fields(monkeypatch):
+    _install_valid_web_session_mint(monkeypatch)
     session = _FakeSession()
     worker = ChatGPTProtocolRegister(
         session=session,
@@ -161,6 +459,210 @@ def test_protocol_register_profile_request_uses_only_supported_fields():
     )
 
     assert set(session.create_body) == {"name", "birthdate"}
+
+
+def test_protocol_profiles_use_current_supported_chrome_fingerprint():
+    profiles = FingerprintPool.from_us_en_desktop().profiles
+
+    assert len(profiles) == 7
+    assert profiles[0].impersonate == "firefox144"
+    assert {profile.impersonate for profile in profiles[1:]} == {
+        PROTOCOL_CHROME_IMPERSONATE
+    }
+    assert all(
+        f"Chrome/{PROTOCOL_CHROME_VERSION}.0.0.0" in profile.user_agent
+        for profile in profiles[1:]
+    )
+
+
+def test_protocol_register_default_session_uses_current_chrome_fingerprint(monkeypatch):
+    captured = {}
+
+    def create_session(**kwargs):
+        captured.update(kwargs)
+        return _FakeSession()
+
+    monkeypatch.setattr(protocol_register.requests, "Session", create_session)
+
+    worker = ChatGPTProtocolRegister()
+
+    assert captured["impersonate"] == PROTOCOL_CHROME_IMPERSONATE
+    assert f"Chrome/{PROTOCOL_CHROME_VERSION}.0.0.0" in worker.user_agent
+
+
+def test_protocol_register_rotates_proxy_and_rebuilds_session_on_cloudflare(monkeypatch):
+    class ChallengeSession(_FakeSession):
+        def get(self, url, **kwargs):
+            self.calls.append(("GET", url, kwargs))
+            if url == CHATGPT_APP:
+                return _FakeResponse(
+                    status_code=403,
+                    headers={"content-type": "text/html; charset=utf-8"},
+                    text="<html><title>Just a moment...</title></html>",
+                    url=url,
+                )
+            return super().get(url, **kwargs)
+
+    sessions = [ChallengeSession(), _FakeSession()]
+    created = []
+
+    def create_session(**_kwargs):
+        session = sessions.pop(0)
+        created.append(session)
+        return session
+
+    monkeypatch.setattr(protocol_register.requests, "Session", create_session)
+    _install_valid_web_session_mint(monkeypatch)
+    rotations = []
+    worker = ChatGPTProtocolRegister(
+        proxy="http://mihomo:7901",
+        otp_callback=lambda: "123456",
+        proxy_rotate_callback=lambda: rotations.append(True) or "http://mihomo:7901",
+    )
+
+    result = worker.run(email="rotate@example.com", password="StrongPass123!")
+
+    assert result["access_token"] == "web-codex-access"
+    assert rotations == [True]
+    assert len(created) == 2
+    assert all(session.closed for session in created)
+
+
+def test_protocol_register_rotates_proxy_when_signup_submission_is_challenged(monkeypatch):
+    class SignupChallengeSession(_FakeSession):
+        def post(self, url, **kwargs):
+            if url == OPENAI_API_ENDPOINTS["signup"]:
+                self.calls.append(("POST", url, kwargs))
+                return _FakeResponse(
+                    status_code=403,
+                    headers={"content-type": "text/html; charset=utf-8"},
+                    text="<html><title>Just a moment...</title></html>",
+                    url=url,
+                )
+            return super().post(url, **kwargs)
+
+    sessions = [SignupChallengeSession(), _FakeSession()]
+    created = []
+
+    def create_session(**_kwargs):
+        session = sessions.pop(0)
+        created.append(session)
+        return session
+
+    monkeypatch.setattr(protocol_register.requests, "Session", create_session)
+    rotations = []
+    worker = ChatGPTProtocolRegister(
+        proxy="http://mihomo:7901",
+        otp_callback=lambda: "123456",
+        proxy_rotate_callback=lambda: rotations.append(True) or "http://mihomo:7902",
+    )
+
+    result = worker._run_codex_registration(
+        email="signup-cf@example.com",
+        password="StrongPass123!",
+    )
+
+    assert result["refresh_token"] == "codex-refresh"
+    assert rotations == [True]
+    assert len(created) == 2
+    assert created[0].closed is True
+    assert created[1].closed is False
+
+
+def test_non_cloudflare_html_403_is_not_treated_as_a_challenge():
+    response = _FakeResponse(
+        status_code=403,
+        headers={"content-type": "text/html; charset=utf-8"},
+        text="<html><title>Access denied</title></html>",
+    )
+
+    assert protocol_register._is_cloudflare_challenge_response(response) is False
+
+
+def test_normal_oauth_html_with_cloudflare_script_text_is_not_a_challenge():
+    response = _FakeResponse(
+        status_code=200,
+        headers={"content-type": "text/html; charset=utf-8", "server": "cloudflare"},
+        text=(
+            "<html><script>window.cloudflare = true</script>"
+            "<script src=\"/cdn-cgi/challenge-platform/scripts/jsd/main.js\"></script>"
+            "<body>OAuth authorize</body></html>"
+        ),
+    )
+
+    assert protocol_register._is_cloudflare_challenge_response(response) is False
+
+
+def test_cloudflare_challenge_page_with_http_200_is_detected():
+    response = _FakeResponse(
+        status_code=200,
+        headers={"content-type": "text/html; charset=utf-8"},
+        text="<html><title>Just a moment...</title></html>",
+    )
+
+    assert protocol_register._is_cloudflare_challenge_response(response) is True
+
+
+def test_oauth_initialization_retries_transient_tls_error_with_new_session(monkeypatch):
+    class _TlsFailureSession(_FakeSession):
+        def get(self, url, **kwargs):
+            if url.startswith(f"{OPENAI_AUTH}/oauth/authorize?"):
+                raise CurlError(
+                    "TLS connect error",
+                    CurlECode.SSL_CONNECT_ERROR,
+                )
+            return super().get(url, **kwargs)
+
+    first = _TlsFailureSession()
+    second = _FakeSession()
+    sessions = [first, second]
+    created = []
+
+    def create_session(**_kwargs):
+        session = sessions.pop(0)
+        created.append(session)
+        return session
+
+    monkeypatch.setattr(protocol_register.requests, "Session", create_session)
+    logs = []
+    worker = ChatGPTProtocolRegister(log_fn=logs.append)
+    waits = []
+    monkeypatch.setattr(worker, "_wait_before_oauth_retry", waits.append)
+
+    response = worker._initialize_codex_registration("user@example.com")
+
+    assert response is not None
+    assert created == [first, second]
+    assert first.closed is True
+    assert len(waits) == 1
+    assert any("curl(35)" in message for message in logs)
+
+
+def test_oauth_initialization_does_not_retry_certificate_failure(monkeypatch):
+    class _CertificateFailureSession(_FakeSession):
+        def get(self, url, **kwargs):
+            if url.startswith(f"{OPENAI_AUTH}/oauth/authorize?"):
+                raise CurlError(
+                    "certificate verify failed",
+                    CurlECode.PEER_FAILED_VERIFICATION,
+                )
+            return super().get(url, **kwargs)
+
+    session = _CertificateFailureSession()
+    created = []
+
+    def create_session(**_kwargs):
+        created.append(session)
+        return session
+
+    monkeypatch.setattr(protocol_register.requests, "Session", create_session)
+    worker = ChatGPTProtocolRegister()
+
+    with pytest.raises(CurlError, match="certificate verify failed"):
+        worker._initialize_codex_registration("user@example.com")
+
+    assert created == [session]
+    assert session.closed is False
 
 
 def test_protocol_registration_accepts_current_chatgpt_otp_subjects():
@@ -258,7 +760,15 @@ def test_registration_disallowed_is_policy_rejection_no_retry(monkeypatch):
     assert worker2.sentinel.calls == 1
 
 
-def test_protocol_login_uses_the_post_otp_password_form_without_registering():
+def test_protocol_login_uses_the_post_otp_password_form_without_registering(monkeypatch):
+    monkeypatch.setattr(
+        "platforms.chatgpt.credential_checks.mint_chatgpt_refresh_token_from_session",
+        lambda *_args, **_kwargs: {
+            "state": "unknown",
+            "message": "not available in this login fixture",
+            "tokens": {},
+        },
+    )
     class LoginSession:
         def __init__(self):
             self.cookies = _FakeCookies()

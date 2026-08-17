@@ -118,10 +118,27 @@ def test_filter_accounts_by_platform(client):
     assert data["items"][0]["platform"] == "cursor"
 
 
-def test_account_stats(client):
-    _create_account()
-    resp = client.get("/api/accounts/stats")
-    assert resp.status_code == 200
+def test_filter_accounts_by_refresh_token(client):
+    _create_account(
+        email="with-rt@test.com",
+        extra={"access_token": "access-with-rt", "refresh_token": "refresh-token"},
+    )
+    _create_account(
+        email="without-rt@test.com",
+        extra={"access_token": "access-without-rt"},
+    )
+
+    with_rt = client.get("/api/accounts", params={"has_refresh_token": "true"})
+    without_rt = client.get("/api/accounts", params={"has_refresh_token": "false"})
+
+    assert with_rt.status_code == 200
+    assert with_rt.json()["total"] == 1
+    assert with_rt.json()["items"][0]["email"] == "with-rt@test.com"
+    assert with_rt.json()["items"][0]["has_refresh_token"] is True
+    assert without_rt.status_code == 200
+    assert without_rt.json()["total"] == 1
+    assert without_rt.json()["items"][0]["email"] == "without-rt@test.com"
+    assert without_rt.json()["items"][0]["has_refresh_token"] is False
 
 
 def test_export_any2api_multi_platform(client):

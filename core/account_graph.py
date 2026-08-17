@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import datetime, timezone
 import json
 from typing import Any
@@ -1033,28 +1032,4 @@ def matches_status_filter(graph: dict[str, Any], status: str) -> bool:
         _text(graph.get("lifecycle_status")),
         _text(graph.get("plan_state")),
         _text(graph.get("validity_status")),
-    }
-
-
-def compute_account_stats(graphs: list[dict[str, Any]], platforms: list[str]) -> dict[str, dict[str, int]]:
-    by_platform: dict[str, int] = defaultdict(int)
-    by_lifecycle_status: dict[str, int] = defaultdict(int)
-    by_plan_state: dict[str, int] = defaultdict(int)
-    by_validity_status: dict[str, int] = defaultdict(int)
-    by_display_status: dict[str, int] = defaultdict(int)
-
-    for platform in platforms:
-        by_platform[platform] += 1
-    for graph in graphs:
-        by_lifecycle_status[_text(graph.get("lifecycle_status") or "registered")] += 1
-        by_plan_state[_text(graph.get("plan_state") or "unknown")] += 1
-        by_validity_status[_text(graph.get("validity_status") or "unknown")] += 1
-        by_display_status[_text(graph.get("display_status") or "registered")] += 1
-
-    return {
-        "by_platform": dict(by_platform),
-        "by_lifecycle_status": dict(by_lifecycle_status),
-        "by_plan_state": dict(by_plan_state),
-        "by_validity_status": dict(by_validity_status),
-        "by_display_status": dict(by_display_status),
     }

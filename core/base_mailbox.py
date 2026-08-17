@@ -77,6 +77,25 @@ class FallbackMailbox(BaseMailbox):
                 errors.append(f"{key}: {exc}")
         raise RuntimeError("所有邮箱 provider 均创建失败: " + " | ".join(errors))
 
+    def test_connection(self) -> None:
+        """Remove unavailable providers before concurrent workers start."""
+        available: list[tuple[str, BaseMailbox]] = []
+        errors: list[str] = []
+        for key, mailbox in self.providers:
+            tester = getattr(mailbox, "test_connection", None)
+            if not callable(tester):
+                available.append((key, mailbox))
+                continue
+            try:
+                tester()
+            except Exception as exc:
+                errors.append(f"{key}: {exc}")
+            else:
+                available.append((key, mailbox))
+        self.providers = available
+        if not available:
+            raise RuntimeError("所有邮箱 provider 连接失败: " + " | ".join(errors))
+
     def get_current_ids(self, account: MailboxAccount) -> set:
         return self._resolve(account).get_current_ids(account)
 
@@ -132,7 +151,7 @@ def _create_local_ms_pool(extra: dict, proxy: str | None) -> BaseMailbox:
         graph_scope=extra.get("local_ms_graph_scope", ""),
         allow_reuse=str(extra.get("local_ms_pool_allow_reuse", "")).strip().lower()
         in {"1", "true", "yes", "on"},
-        alias_count=extra.get("local_ms_pool_alias_count", 1),
+        alias_count=extra.get("local_ms_pool_alias_count", 6),
         proxy=proxy,
     )
 
@@ -151,9 +170,25 @@ def _create_api_mailbox(extra: dict, proxy: str | None) -> BaseMailbox:
     )
 
 
+def _create_domain_imap_catchall(extra: dict, proxy: str | None) -> BaseMailbox:
+    del proxy  # IMAP is a direct connection; proxy routing is not supported by imaplib.
+    from core.domain_imap_mailbox import DomainImapCatchallMailbox
+
+    return DomainImapCatchallMailbox.from_config(extra)
+
+
+def _create_domain_inbucket(extra: dict, proxy: str | None) -> BaseMailbox:
+    del proxy
+    from core.inbucket_domain_mailbox import InbucketDomainMailbox
+
+    return InbucketDomainMailbox.from_config(extra)
+
+
 MAILBOX_FACTORY_REGISTRY = {
     "local_ms_pool": _create_local_ms_pool,
     "api_mailbox": _create_api_mailbox,
+    "domain_imap_catchall": _create_domain_imap_catchall,
+    "domain_inbucket": _create_domain_inbucket,
 }
 
 
@@ -163,28 +198,15 @@ def create_mailbox(provider: str, extra: dict | None = None, proxy: str | None =
 
     provider_key = str(provider or "").strip()
     if not provider_key:
-        raise RuntimeError("未选择邮箱 provider，请先在设置页配置并启用默认邮箱 provider")
+        raise RuntimeError("未选择邮箱服务，请在注册弹窗中手动选择")
 
     definitions = ProviderDefinitionsRepository()
     settings = ProviderSettingsRepository()
-    ordered_keys = [provider_key]
-    ordered_keys.extend(
-        key
-        for key in (str(item.provider_key or "").strip() for item in settings.list_enabled("mailbox"))
-        if key and key not in ordered_keys
-    )
-
-    providers: list[tuple[str, BaseMailbox]] = []
-    for key in ordered_keys:
-        definition = definitions.get_by_key("mailbox", key)
-        if not definition or not definition.enabled:
-            continue
-        factory = MAILBOX_FACTORY_REGISTRY.get(definition.driver_type or key)
-        if factory is None:
-            continue
-        resolved = settings.resolve_runtime_settings("mailbox", key, dict(extra or {}))
-        providers.append((key, factory(resolved, proxy)))
-
-    if not providers:
+    definition = definitions.get_by_key("mailbox", provider_key)
+    if not definition or not definition.enabled:
         raise RuntimeError(f"邮箱 provider 不存在、未启用或不受支持: {provider_key}")
-    return providers[0][1] if len(providers) == 1 else FallbackMailbox(providers)
+    factory = MAILBOX_FACTORY_REGISTRY.get(definition.driver_type or provider_key)
+    if factory is None:
+        raise RuntimeError(f"邮箱 provider 不存在、未启用或不受支持: {provider_key}")
+    resolved = settings.resolve_runtime_settings("mailbox", provider_key, dict(extra or {}))
+    return factory(resolved, proxy)

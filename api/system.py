@@ -7,6 +7,7 @@ import requests
 from fastapi import APIRouter
 
 from core.version import __version__
+from core.runtime_mode import har_capture_available, runtime_mode
 
 router = APIRouter(prefix="/system", tags=["system"])
 
@@ -76,5 +77,13 @@ def get_version():
         "current": current,
         "latest": latest,
         "has_update": has_update,
+    }
+
+
+@router.get("/runtime")
+def get_runtime_capabilities():
+    return {
+        "mode": runtime_mode(),
+        "har_capture_available": har_capture_available(),
     }
 

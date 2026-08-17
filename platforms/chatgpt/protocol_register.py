@@ -15,12 +15,15 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Callable
-from urllib.parse import urlencode, urljoin
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
-from curl_cffi import requests
+from curl_cffi import CurlECode, CurlError, requests
 
 from .constants import (
     CHATGPT_APP,
+    CODEX_CLIENT_ID,
+    CODEX_REDIRECT_URI,
+    CODEX_SCOPE,
     OPENAI_API_ENDPOINTS,
     OPENAI_AUTH,
     SENTINEL_BASE,
@@ -30,12 +33,38 @@ from .constants import (
 )
 from .environment_profile import (
     FingerprintPool,
+    PROTOCOL_CHROME_IMPERSONATE,
+    PROTOCOL_CHROME_VERSION,
     ProtocolEnvironmentProfile,
     _browser_family,
 )
 from .sentinel_vm import get_sentinel_sdk, get_sentinel_vm_pool
+from .oauth import OAuthStart, generate_oauth_url, submit_callback_url
 
 _logger = logging.getLogger(__name__)
+
+
+_OAUTH_INIT_MAX_ATTEMPTS = 6
+_OAUTH_INIT_RETRY_BASE_SECONDS = 0.75
+_OAUTH_INIT_RETRY_MAX_SECONDS = 8.0
+_TRANSIENT_CURL_CODES = frozenset(
+    {
+        int(CurlECode.COULDNT_RESOLVE_PROXY),
+        int(CurlECode.COULDNT_RESOLVE_HOST),
+        int(CurlECode.COULDNT_CONNECT),
+        int(CurlECode.HTTP2),
+        int(CurlECode.PARTIAL_FILE),
+        int(CurlECode.OPERATION_TIMEDOUT),
+        int(CurlECode.SSL_CONNECT_ERROR),
+        int(CurlECode.GOT_NOTHING),
+        int(CurlECode.SEND_ERROR),
+        int(CurlECode.RECV_ERROR),
+        int(CurlECode.HTTP2_STREAM),
+        int(CurlECode.HTTP3),
+        int(CurlECode.QUIC_CONNECT_ERROR),
+        int(CurlECode.PROXY),
+    }
+)
 
 
 FIRST_NAMES = (
@@ -68,6 +97,43 @@ def _decode_jwt_payload(token: str) -> dict:
         return {}
 
 
+def _authorization_page_type(payload: dict) -> str:
+    page = payload.get("page") if isinstance(payload.get("page"), dict) else {}
+    return str(page.get("type") or payload.get("page_type") or "").strip()
+
+
+def _authorization_continue_url(payload: dict) -> str:
+    for key in ("continue_url", "external_url", "redirect_url", "url"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _oauth_callback_target(url: str, oauth_start: OAuthStart) -> bool:
+    candidate = urlparse(str(url or "").strip())
+    target = urlparse(oauth_start.redirect_uri)
+    return bool(
+        candidate.scheme == target.scheme
+        and candidate.netloc == target.netloc
+        and candidate.path.rstrip("/") == target.path.rstrip("/")
+    )
+
+
+def _password_registration_step(page_type: str, continue_url: str = "") -> bool:
+    normalized = str(page_type or "").strip().lower()
+    target = str(continue_url or "").strip().lower()
+    return normalized in {"password", "create_account_password"} or "create-account/password" in target
+
+
+def _email_otp_step(page_type: str, continue_url: str = "") -> bool:
+    normalized = str(page_type or "").strip().lower()
+    target = str(continue_url or "").strip().lower()
+    return normalized in {"email_otp_send", "email_otp_verification"} or any(
+        marker in target for marker in ("email-verification", "email-otp")
+    )
+
+
 def _response_json(response) -> dict:
     try:
         payload = response.json()
@@ -90,6 +156,113 @@ def _response_error(response, payload: dict | None = None) -> str:
         return error
     text = str(getattr(response, "text", "") or "").strip()
     return text[:300] or f"HTTP {getattr(response, 'status_code', 0)}"
+
+
+class ChatGPTCloudflareChallengeError(RuntimeError):
+    """The web edge returned a challenge instead of an OAuth response."""
+
+    def __init__(self, stage: str, response) -> None:
+        status = int(getattr(response, "status_code", 0) or 0)
+        self.status_code = status
+        self.stage = str(stage or "web request")
+        super().__init__(
+            f"Cloudflare challenge during {self.stage} (HTTP {status or '-'})"
+        )
+
+
+class DirectCodexRegistrationUnavailable(RuntimeError):
+    """The direct Codex registration bootstrap could not enter a signup state."""
+
+
+def _is_cloudflare_challenge_response(response) -> bool:
+    status = int(getattr(response, "status_code", 0) or 0)
+    headers = {
+        str(key).strip().lower(): str(value or "").strip().lower()
+        for key, value in (getattr(response, "headers", {}) or {}).items()
+    }
+    content_type = headers.get("content-type", "")
+    try:
+        body = str(getattr(response, "text", "") or "").lower()
+    except Exception:
+        body = ""
+    if headers.get("cf-mitigated") == "challenge":
+        return True
+    if "text/html" not in content_type:
+        return False
+    if any(
+        marker in body
+        for marker in (
+            "<title>just a moment",
+            "cf-chl-",
+            "cf_chl_",
+            "verify you are human",
+            "checking your browser",
+            "enable javascript and cookies",
+            "unable to load site",
+            "using a vpn, try turning it off",
+        )
+    ):
+        return True
+    # Cloudflare's current blocked page may omit its brand in the body while
+    # still exposing the CDN identity in response headers.
+    return status == 403 and (
+        headers.get("server") == "cloudflare" or "cf-ray" in headers
+    )
+
+
+def _authorization_error_from_url(value: str) -> str:
+    parsed = urlparse(str(value or ""))
+    if parsed.path.rstrip("/") != "/error":
+        return ""
+    query = parse_qs(parsed.query)
+    direct_error = str((query.get("error") or [""])[0]).strip()
+    direct_description = str(
+        (query.get("error_description") or [""])[0]
+    ).strip()
+    encoded_payload = str((query.get("payload") or [""])[0]).strip()
+    payload: dict = {}
+    if encoded_payload:
+        try:
+            padded = encoded_payload + "=" * (-len(encoded_payload) % 4)
+            decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+            candidate = json.loads(decoded.decode("utf-8"))
+            if isinstance(candidate, dict):
+                payload = candidate
+        except Exception:
+            payload = {}
+    code = str(
+        payload.get("errorCode")
+        or payload.get("error_code")
+        or payload.get("error")
+        or direct_error
+        or "authorization_error"
+    ).strip()
+    description = str(
+        payload.get("message")
+        or payload.get("errorDescription")
+        or payload.get("error_description")
+        or direct_description
+        or ""
+    ).strip()
+    return f"{code}: {description}" if description and description != code else code
+
+
+def _raise_if_explicit_account_ban(payload: dict, *, stage: str) -> None:
+    if not payload:
+        return
+    # Keep the deletion signal tied to structured OpenAI auth data. Generic
+    # HTML, Cloudflare pages and transport failures must remain inconclusive.
+    from .credential_checks import (
+        ChatGPTAccountBannedDuringRelogin,
+        _explicit_ban_code,
+    )
+
+    code = _explicit_ban_code(payload)
+    if code:
+        raise ChatGPTAccountBannedDuringRelogin(
+            f"{stage}明确返回 {code}",
+            code=code,
+        )
 
 
 class _SentinelTokenGenerator:
@@ -379,7 +552,8 @@ class ChatGPTProtocolRegister:
 
     user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{PROTOCOL_CHROME_VERSION}.0.0.0 Safari/537.36"
     )
 
     def __init__(
@@ -389,7 +563,8 @@ class ChatGPTProtocolRegister:
         otp_callback: Callable[[], str] | None = None,
         log_fn: Callable[[str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
-        impersonate: str = "chrome131",
+        proxy_rotate_callback: Callable[[], str | None] | None = None,
+        impersonate: str = PROTOCOL_CHROME_IMPERSONATE,
         session=None,
         request_timeout: float = 60,
         profile: ProtocolEnvironmentProfile | None = None,
@@ -407,14 +582,22 @@ class ChatGPTProtocolRegister:
         self.otp_callback = otp_callback
         self.log = log_fn or (lambda _message: None)
         self.cancel_check = cancel_check or (lambda: False)
+        self.proxy_rotate_callback = proxy_rotate_callback
+        self._session_factory: Callable[[], object] | None = None
         if session is None:
-            kwargs = {
-                "impersonate": impersonate,
-                "timeout": max(float(request_timeout or 60), 1.0),
-            }
-            if self.proxy:
-                kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
-            session = requests.Session(**kwargs)
+            request_timeout = max(float(request_timeout or 60), 1.0)
+
+            def create_session():
+                kwargs = {
+                    "impersonate": impersonate,
+                    "timeout": request_timeout,
+                }
+                if self.proxy:
+                    kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
+                return requests.Session(**kwargs)
+
+            self._session_factory = create_session
+            session = self._session_factory()
         self.session = session
         self.sentinel = OpenAISentinelClient(
             session,
@@ -455,33 +638,166 @@ class ChatGPTProtocolRegister:
                 return None
             self._check_cancelled()
             response = self.session.get(urljoin(OPENAI_AUTH, current), allow_redirects=False)
+            if _is_cloudflare_challenge_response(response):
+                raise ChatGPTCloudflareChallengeError("OAuth redirect", response)
+            payload = _response_json(response)
+            _raise_if_explicit_account_ban(payload, stage="OpenAI OAuth 重定向")
+            if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
+                raise RuntimeError(
+                    f"OpenAI OAuth 重定向失败: {_response_error(response, payload)}"
+                )
             current = str(response.headers.get("location") or "").strip()
             if not current:
                 return response
         raise RuntimeError("OpenAI 授权重定向次数过多")
 
-    def _initialize_signup(self, email: str):
-        self.log("初始化 ChatGPT 协议注册会话...")
+    @staticmethod
+    def _is_transient_curl_error(exc: CurlError) -> bool:
+        try:
+            return int(getattr(exc, "code", 0) or 0) in _TRANSIENT_CURL_CODES
+        except (TypeError, ValueError):
+            return False
+
+    def _rotate_proxy_after_challenge(self) -> bool:
+        return self._rotate_proxy("Cloudflare challenge detected")
+
+    def _rotate_proxy(self, reason: str) -> bool:
+        callback = self.proxy_rotate_callback
+        if not callable(callback):
+            return False
+        try:
+            rotated = callback()
+        except Exception as exc:
+            self.log(f"{reason} 后切换代理失败: {exc}")
+            return False
+        if rotated:
+            self.proxy = str(rotated).strip() or self.proxy
+        self.log(f"{reason}; switched proxy and rebuilt session")
+        return True
+
+    def _replace_owned_session(self) -> None:
+        if self._session_factory is None:
+            raise RuntimeError("Cannot replace an externally managed HTTP session")
+        try:
+            self.sentinel.close()
+        except Exception:
+            pass
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = self._session_factory()
+        self.sentinel = OpenAISentinelClient(
+            self.session,
+            user_agent=self.user_agent,
+            proxy=self.proxy,
+            profile=self._profile,
+        )
+
+    def _wait_before_oauth_retry(self, delay_seconds: float) -> None:
+        deadline = time.monotonic() + max(float(delay_seconds), 0.0)
+        while True:
+            self._check_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.25))
+
+    def _initialize_signup(self, email: str, *, registration: bool = False):
+        for attempt in range(1, _OAUTH_INIT_MAX_ATTEMPTS + 1):
+            try:
+                return self._initialize_signup_once(email, registration=registration)
+            except ChatGPTCloudflareChallengeError as exc:
+                can_retry = (
+                    self._session_factory is not None
+                    and callable(self.proxy_rotate_callback)
+                    and attempt < _OAUTH_INIT_MAX_ATTEMPTS
+                )
+                if not can_retry or not self._rotate_proxy_after_challenge():
+                    raise
+                delay = min(
+                    _OAUTH_INIT_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                    _OAUTH_INIT_RETRY_MAX_SECONDS,
+                )
+                self.log(
+                    f"Cloudflare challenge at {exc.stage}; retrying OAuth "
+                    f"on a new proxy in {delay:.1f}s "
+                    f"({attempt + 1}/{_OAUTH_INIT_MAX_ATTEMPTS})"
+                )
+                self._wait_before_oauth_retry(delay)
+                self._replace_owned_session()
+            except CurlError as exc:
+                can_retry = (
+                    self._session_factory is not None
+                    and self._is_transient_curl_error(exc)
+                    and attempt < _OAUTH_INIT_MAX_ATTEMPTS
+                )
+                if not can_retry:
+                    raise
+                base_delay = min(
+                    _OAUTH_INIT_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                    _OAUTH_INIT_RETRY_MAX_SECONDS,
+                )
+                delay = base_delay * random.uniform(0.8, 1.2)
+                error_code = int(getattr(exc, "code", 0) or 0)
+                if callable(self.proxy_rotate_callback):
+                    self._rotate_proxy(f"OAuth initialization curl({error_code})")
+                self.log(
+                    f"OAuth initialization hit transient curl({error_code}); "
+                    f"retrying in {delay:.1f}s "
+                    f"({attempt + 1}/{_OAUTH_INIT_MAX_ATTEMPTS})"
+                )
+                self._wait_before_oauth_retry(delay)
+                self._replace_owned_session()
+        raise RuntimeError("OAuth initialization retry loop exited unexpectedly")
+
+    def _initialize_signup_once(self, email: str, *, registration: bool = False):
+        self.log("初始化 ChatGPT 协议 OAuth 会话...")
         response = self.session.get(CHATGPT_APP, allow_redirects=True)
         self._check_cancelled()
+        if _is_cloudflare_challenge_response(response):
+            raise ChatGPTCloudflareChallengeError("ChatGPT homepage", response)
         if getattr(response, "status_code", 0) >= 400:
             raise RuntimeError(f"ChatGPT 首页访问失败: {_response_error(response)}")
+        # NextAuth binds the authorization transaction to the ``oai-did``
+        # cookie created by the ChatGPT homepage.  Using the constructor's
+        # provisional UUID in ``ext-oai-did`` while the cookie carries a
+        # different value lets the flow reach OTP delivery, but OTP validation
+        # is then rejected with ``invalid_state``.
+        try:
+            cookie_device_id = str(self.session.cookies.get("oai-did") or "").strip()
+            if cookie_device_id:
+                self.device_id = cookie_device_id
+        except Exception:
+            pass
         csrf_response = self.session.get(f"{CHATGPT_APP}/api/auth/csrf")
         self._check_cancelled()
+        if _is_cloudflare_challenge_response(csrf_response):
+            raise ChatGPTCloudflareChallengeError("ChatGPT CSRF", csrf_response)
         csrf_payload = _response_json(csrf_response)
+        _raise_if_explicit_account_ban(csrf_payload, stage="ChatGPT OAuth CSRF 获取")
         csrf_token = str(csrf_payload.get("csrfToken") or "").strip()
         if getattr(csrf_response, "status_code", 0) != 200 or not csrf_token:
             raise RuntimeError(f"CSRF 获取失败: {_response_error(csrf_response, csrf_payload)}")
 
-        query = urlencode(
-            {
+        if registration:
+            # The ChatGPT NextAuth registration bootstrap currently expects the
+            # plain OpenAI sign-in transaction.  Adding ``screen_hint=signup``
+            # here produces an OTP page that sends mail successfully but whose
+            # validation endpoint rejects the transaction as ``invalid_state``.
+            query_params = {
+                "prompt": "login",
+                "ext-oai-did": self.device_id,
+            }
+        else:
+            query_params = {
                 "prompt": "login",
                 "ext-oai-did": self.device_id,
                 "auth_session_logging_id": str(uuid.uuid4()),
                 "screen_hint": "login_or_signup",
                 "login_hint": email,
             }
-        )
+        query = urlencode(query_params)
         signin_response = self.session.post(
             f"{CHATGPT_APP}/api/auth/signin/openai?{query}",
             data=urlencode(
@@ -501,7 +817,10 @@ class ChatGPTProtocolRegister:
             allow_redirects=False,
         )
         self._check_cancelled()
+        if _is_cloudflare_challenge_response(signin_response):
+            raise ChatGPTCloudflareChallengeError("ChatGPT OAuth sign-in", signin_response)
         signin_payload = _response_json(signin_response)
+        _raise_if_explicit_account_ban(signin_payload, stage="ChatGPT OAuth 初始化")
         location = str(
             signin_payload.get("url")
             or signin_response.headers.get("location")
@@ -510,6 +829,12 @@ class ChatGPTProtocolRegister:
         if getattr(signin_response, "status_code", 0) >= 400 or not location:
             raise RuntimeError(f"OpenAI 注册授权初始化失败: {_response_error(signin_response, signin_payload)}")
         final_response = self._follow_authorize_chain(location)
+        final_url = str(getattr(final_response, "url", "") or "").strip()
+        authorization_error = _authorization_error_from_url(final_url)
+        if authorization_error:
+            raise RuntimeError(
+                f"OpenAI OAuth initialization failed: {authorization_error}"
+            )
         try:
             cookie_device_id = str(self.session.cookies.get("oai-did") or "").strip()
             if cookie_device_id:
@@ -518,15 +843,166 @@ class ChatGPTProtocolRegister:
             pass
         return final_response
 
+    def _initialize_codex_registration(self, email: str) -> OAuthStart:
+        """Start registration inside the Codex PKCE transaction that will issue RT."""
+        for attempt in range(1, _OAUTH_INIT_MAX_ATTEMPTS + 1):
+            try:
+                return self._initialize_codex_registration_once(email)
+            except ChatGPTCloudflareChallengeError as exc:
+                can_retry = (
+                    self._session_factory is not None
+                    and callable(self.proxy_rotate_callback)
+                    and attempt < _OAUTH_INIT_MAX_ATTEMPTS
+                )
+                if not can_retry or not self._rotate_proxy_after_challenge():
+                    raise
+                delay = min(
+                    _OAUTH_INIT_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                    _OAUTH_INIT_RETRY_MAX_SECONDS,
+                )
+                self.log(
+                    f"Cloudflare challenge at {exc.stage}; retrying direct Codex OAuth "
+                    f"on a new proxy in {delay:.1f}s "
+                    f"({attempt + 1}/{_OAUTH_INIT_MAX_ATTEMPTS})"
+                )
+                self._wait_before_oauth_retry(delay)
+                self._replace_owned_session()
+            except CurlError as exc:
+                can_retry = (
+                    self._session_factory is not None
+                    and self._is_transient_curl_error(exc)
+                    and attempt < _OAUTH_INIT_MAX_ATTEMPTS
+                )
+                if not can_retry:
+                    raise
+                base_delay = min(
+                    _OAUTH_INIT_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+                    _OAUTH_INIT_RETRY_MAX_SECONDS,
+                )
+                delay = base_delay * random.uniform(0.8, 1.2)
+                error_code = int(getattr(exc, "code", 0) or 0)
+                if callable(self.proxy_rotate_callback):
+                    self._rotate_proxy(f"Direct Codex OAuth curl({error_code})")
+                self.log(
+                    f"Direct Codex OAuth initialization hit transient curl({error_code}); "
+                    f"retrying in {delay:.1f}s "
+                    f"({attempt + 1}/{_OAUTH_INIT_MAX_ATTEMPTS})"
+                )
+                self._wait_before_oauth_retry(delay)
+                self._replace_owned_session()
+        raise RuntimeError("Direct Codex OAuth initialization retry loop exited unexpectedly")
+
+    def _initialize_codex_registration_once(self, email: str) -> OAuthStart:
+        self._check_cancelled()
+        oauth_start = generate_oauth_url(
+            redirect_uri=CODEX_REDIRECT_URI,
+            scope=CODEX_SCOPE,
+            client_id=CODEX_CLIENT_ID,
+            prompt="login",
+        )
+        self.log(f"初始化 Codex OAuth 注册事务: {email}")
+        response = self.session.get(oauth_start.auth_url, allow_redirects=True)
+        self._check_cancelled()
+        if _is_cloudflare_challenge_response(response):
+            raise ChatGPTCloudflareChallengeError("Codex OAuth registration", response)
+        payload = _response_json(response)
+        _raise_if_explicit_account_ban(payload, stage="Codex OAuth 注册初始化")
+        if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
+            raise RuntimeError(
+                f"Codex OAuth 注册初始化失败: {_response_error(response, payload)}"
+            )
+        final_url = str(getattr(response, "url", "") or oauth_start.auth_url).strip()
+        authorization_error = _authorization_error_from_url(final_url)
+        if authorization_error:
+            raise RuntimeError(
+                f"Codex OAuth registration initialization failed: {authorization_error}"
+            )
+        try:
+            cookie_device_id = str(self.session.cookies.get("oai-did") or "").strip()
+            if cookie_device_id:
+                self.device_id = cookie_device_id
+        except Exception:
+            pass
+        return oauth_start
+
     def _validate_otp(self, code: str) -> dict:
+        headers = self._common_headers(f"{OPENAI_AUTH}/email-verification")
+        headers.update(
+            {
+                "oai-device-id": self.device_id,
+                "sec-fetch-site": "same-origin",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-dest": "empty",
+            }
+        )
         response = self.session.post(
             OPENAI_API_ENDPOINTS["validate_otp"],
             json={"code": code},
-            headers=self._common_headers(f"{OPENAI_AUTH}/email-verification"),
+            headers=headers,
         )
         payload = _response_json(response)
+        _raise_if_explicit_account_ban(payload, stage="OpenAI 登录验证码校验")
         if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
             raise RuntimeError(f"邮箱验证码校验失败: {_response_error(response, payload)}")
+        return payload
+
+    def _send_otp(self, referer: str = "") -> dict:
+        resolved_referer = urljoin(OPENAI_AUTH, referer or "/email-verification")
+        response = self.session.get(
+            OPENAI_API_ENDPOINTS["send_otp"],
+            headers={
+                "accept": "application/json, text/plain, */*",
+                "origin": OPENAI_AUTH,
+                "referer": resolved_referer,
+                "oai-device-id": self.device_id,
+                "sec-fetch-site": "same-origin",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-dest": "empty",
+                "user-agent": self.user_agent,
+            },
+            allow_redirects=True,
+        )
+        payload = _response_json(response)
+        _raise_if_explicit_account_ban(payload, stage="OpenAI 邮箱验证码发送")
+        if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
+            raise RuntimeError(f"发送邮箱验证码失败: {_response_error(response, payload)}")
+        self.log("邮箱验证码已发送")
+        return payload
+
+    def _submit_signup_email(self, email: str) -> dict:
+        headers = self._common_headers(f"{OPENAI_AUTH}/create-account")
+        headers["oai-device-id"] = self.device_id
+        headers.update(self.sentinel.build_headers(
+            self.device_id,
+            "authorize_continue",
+        ))
+        response = self.session.post(
+            OPENAI_API_ENDPOINTS["signup"],
+            json={
+                "username": {"value": email, "kind": "email"},
+                "screen_hint": "signup",
+            },
+            headers=headers,
+        )
+        if _is_cloudflare_challenge_response(response):
+            raise ChatGPTCloudflareChallengeError("OpenAI signup", response)
+        payload = _response_json(response)
+        _raise_if_explicit_account_ban(payload, stage="OpenAI signup email submission")
+        if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
+            raise RuntimeError(
+                f"OpenAI signup email submission failed: {_response_error(response, payload)}"
+            )
+        page_type = _authorization_page_type(payload)
+        if page_type not in {
+            "password",
+            "create_account_password",
+            "email_otp_send",
+            "email_otp_verification",
+        }:
+            raise RuntimeError(
+                f"OpenAI signup returned unexpected authorization step: {page_type or 'unknown'}"
+            )
+        self.log(f"OpenAI signup email submitted: next={page_type}")
         return payload
 
     def _register_password(self, email: str, password: str) -> dict:
@@ -541,6 +1017,7 @@ class ChatGPTProtocolRegister:
             headers=headers,
         )
         payload = _response_json(response)
+        _raise_if_explicit_account_ban(payload, stage="OpenAI 密码设置")
         if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
             raise RuntimeError(f"设置 ChatGPT 密码失败: {_response_error(response, payload)}")
         return payload
@@ -577,6 +1054,7 @@ class ChatGPTProtocolRegister:
             allow_redirects=False,
         )
         payload = _response_json(response)
+        _raise_if_explicit_account_ban(payload, stage="OpenAI 密码登录")
         if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
             raise RuntimeError(f"ChatGPT protocol login failed: {_response_error(response, payload)}")
         return {"continue_url": str(response.headers.get("location") or "")}
@@ -599,6 +1077,7 @@ class ChatGPTProtocolRegister:
             headers=headers,
         )
         payload = _response_json(response)
+        _raise_if_explicit_account_ban(payload, stage="OpenAI 创建账号")
         if getattr(response, "status_code", 0) < 400 and not payload.get("error"):
             return payload
         last_error = _response_error(response, payload)
@@ -609,11 +1088,171 @@ class ChatGPTProtocolRegister:
             )
         raise RuntimeError(f"创建 ChatGPT 账号失败: {last_error}")
 
+    def _visit_auth_step(self, continue_url: str, *, referer: str) -> object | None:
+        target = str(continue_url or "").strip()
+        if not target:
+            return None
+        response = self.session.get(
+            urljoin(OPENAI_AUTH, target),
+            headers={
+                "referer": urljoin(OPENAI_AUTH, referer),
+                "user-agent": self.user_agent,
+            },
+            allow_redirects=True,
+        )
+        if _is_cloudflare_challenge_response(response):
+            raise ChatGPTCloudflareChallengeError("OpenAI registration step", response)
+        payload = _response_json(response)
+        _raise_if_explicit_account_ban(payload, stage="OpenAI 注册页面跳转")
+        if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
+            raise RuntimeError(f"OpenAI 注册页面跳转失败: {_response_error(response, payload)}")
+        return response
+
+    def _follow_codex_callback(
+        self,
+        oauth_start: OAuthStart,
+        continue_url: str,
+    ) -> str:
+        current = urljoin(OPENAI_AUTH, str(continue_url or "").strip())
+        if not current:
+            return ""
+        for _ in range(15):
+            self._check_cancelled()
+            if _oauth_callback_target(current, oauth_start):
+                return current
+            response = self.session.get(
+                current,
+                headers={"referer": OPENAI_AUTH, "user-agent": self.user_agent},
+                allow_redirects=False,
+            )
+            if _is_cloudflare_challenge_response(response):
+                raise ChatGPTCloudflareChallengeError("Codex OAuth callback", response)
+            payload = _response_json(response)
+            _raise_if_explicit_account_ban(payload, stage="Codex OAuth 授权回调")
+            if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
+                raise RuntimeError(
+                    f"Codex OAuth 授权跳转失败: {_response_error(response, payload)}"
+                )
+            candidate = str(
+                getattr(response, "headers", {}).get("location")
+                or _authorization_continue_url(payload)
+                or ""
+            ).strip()
+            if not candidate:
+                return ""
+            current = urljoin(current, candidate)
+        raise RuntimeError("Codex OAuth 授权重定向次数过多")
+
+    def _complete_codex_registration_oauth(
+        self,
+        oauth_start: OAuthStart,
+        *,
+        email: str,
+        continue_url: str = "",
+    ) -> dict:
+        callback_url = ""
+        if continue_url:
+            callback_url = self._follow_codex_callback(oauth_start, continue_url)
+        if not callback_url:
+            from platforms.chatgpt.credential_checks import (
+                _authorization_code_from_session,
+                _authorization_code_via_account_selection,
+            )
+
+            proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
+            try:
+                callback_url = _authorization_code_from_session(
+                    self.session,
+                    oauth_start=oauth_start,
+                    proxies=proxies,
+                    cancel_check=self.cancel_check,
+                )
+            except RuntimeError as silent_error:
+                self.log(
+                    f"Codex OAuth 直接回调未完成，继续账号/工作区选择: {silent_error}"
+                )
+                callback_url = _authorization_code_via_account_selection(
+                    self.session,
+                    oauth_start=oauth_start,
+                    email=email,
+                    device_id=self.device_id,
+                    sentinel_client=self.sentinel,
+                    proxies=proxies,
+                    cancel_check=self.cancel_check,
+                )
+        tokens = json.loads(
+            submit_callback_url(
+                callback_url=callback_url,
+                expected_state=oauth_start.state,
+                code_verifier=oauth_start.code_verifier,
+                redirect_uri=oauth_start.redirect_uri,
+                client_id=oauth_start.client_id,
+                proxy_url=self.proxy,
+                session=self.session,
+            )
+        )
+        if not str(tokens.get("access_token") or "").strip():
+            raise RuntimeError("Codex OAuth token 响应缺少 access_token")
+        if not str(tokens.get("refresh_token") or "").strip():
+            raise RuntimeError("Codex OAuth token 响应缺少 refresh_token")
+        tokens["client_id"] = oauth_start.client_id
+        self.log("同一注册事务已获取 Codex OAuth refresh token")
+        return tokens
+
+    def _codex_registration_result(
+        self,
+        email: str,
+        password: str,
+        tokens: dict,
+    ) -> dict:
+        access_token = str(tokens.get("access_token") or "").strip()
+        id_token = str(tokens.get("id_token") or "").strip()
+        claims = _decode_jwt_payload(id_token) or _decode_jwt_payload(access_token)
+        auth_claims = claims.get("https://api.openai.com/auth")
+        if not isinstance(auth_claims, dict):
+            auth_claims = {}
+        account_id = str(
+            tokens.get("account_id")
+            or auth_claims.get("chatgpt_account_id")
+            or ""
+        ).strip()
+        workspace_id = str(
+            auth_claims.get("organization_id")
+            or auth_claims.get("chatgpt_account_id")
+            or account_id
+        ).strip()
+        try:
+            cookies = self.session.cookies.get_dict()
+        except Exception:
+            cookies = {}
+        session_token = ""
+        try:
+            session_token = str(
+                self.session.cookies.get("__Secure-next-auth.session-token") or ""
+            ).strip()
+        except Exception:
+            pass
+        return {
+            "email": str(tokens.get("email") or email).strip() or email,
+            "password": password,
+            "account_id": account_id,
+            "workspace_id": workspace_id,
+            "access_token": access_token,
+            "session_token": session_token,
+            "refresh_token": str(tokens.get("refresh_token") or "").strip(),
+            "id_token": id_token,
+            "client_id": str(tokens.get("client_id") or CODEX_CLIENT_ID).strip(),
+            "cookies": cookies,
+            "profile": {"email": str(tokens.get("email") or email).strip()},
+            "expires_at": str(tokens.get("expired") or "").strip(),
+        }
+
     def _session_result(self, email: str, password: str) -> dict:
         self._check_cancelled()
         response = self.session.get(f"{CHATGPT_APP}/api/auth/session")
         self._check_cancelled()
         payload = _response_json(response)
+        _raise_if_explicit_account_ban(payload, stage="ChatGPT 会话获取")
         access_token = str(payload.get("accessToken") or "").strip()
         if getattr(response, "status_code", 0) != 200 or not access_token:
             raise RuntimeError(f"注册完成但获取 ChatGPT session 失败: {_response_error(response, payload)}")
@@ -643,14 +1282,23 @@ class ChatGPTProtocolRegister:
                 email=email,
                 device_id=self.device_id,
                 sentinel_client=self.sentinel,
-                prefer_account_selection=True,
+                # A freshly-created ChatGPT session can authorize the Codex
+                # public client silently after a short propagation delay.  The
+                # explicit account chooser currently routes new accounts to an
+                # ``add_phone`` gate, so try the session-backed ``prompt=none``
+                # path before falling back to account selection.
+                prefer_account_selection=False,
                 cancel_check=self.cancel_check,
             )
             if recovered.get("state") == "valid":
                 oauth_tokens = dict(recovered.get("tokens") or {})
                 self.log("已获取 OAuth refresh token")
             else:
-                self.log(f"未获取 OAuth refresh token: {recovered.get('message', '')}")
+                oauth_message = str(recovered.get("message") or "").strip()
+                if "add_phone" in oauth_message or "手机号验证" in oauth_message:
+                    self.log("本次 OAuth 命中 add_phone，按正常无 RT 账号保存")
+                else:
+                    self.log(f"未获取 OAuth refresh token: {oauth_message}")
         except Exception as exc:
             self.log(f"获取 OAuth refresh token 失败: {exc}")
         return {
@@ -669,11 +1317,11 @@ class ChatGPTProtocolRegister:
         }
 
     def login(self, *, email: str, password: str) -> dict:
-        """Log in to an existing account without entering the registration flow."""
+        """Log in through the same OAuth bootstrap used by registration."""
         if not str(email or "").strip() or not str(password or ""):
             raise RuntimeError("ChatGPT protocol login requires email and password")
         self._check_cancelled()
-        self.log(f"Starting ChatGPT protocol login: {email}")
+        self.log(f"开始复用 ChatGPT 注册协议登录: {email}")
         try:
             login_page = self._initialize_signup(email)
             self._check_cancelled()
@@ -705,48 +1353,18 @@ class ChatGPTProtocolRegister:
                 self.session.close()
             except Exception:
                 pass
-
-    def run(self, *, email: str, password: str) -> dict:
-        if not str(email or "").strip():
-            raise RuntimeError("协议注册缺少邮箱")
-        if not callable(self.otp_callback):
-            raise RuntimeError("协议注册缺少邮箱验证码回调")
-        self._check_cancelled()
-        self.log(f"开始 ChatGPT 协议注册: {email}")
+    def _run_legacy_web_registration(self, *, email: str, password: str) -> dict:
+        """Create the account through ChatGPT NextAuth, then mint Codex tokens."""
+        self.log(f"开始 ChatGPT Web 协议注册: {email}")
         try:
-            self._initialize_signup(email)
-            code = str(self.otp_callback() or "").strip()
-            if not code:
-                raise RuntimeError("未收到邮箱验证码")
-            validation = self._validate_otp(code)
-            self.log("邮箱验证码校验通过")
-            continue_url = str(validation.get("continue_url") or "").strip()
-            if continue_url:
-                self.session.get(
-                    urljoin(OPENAI_AUTH, continue_url),
-                    headers={
-                        "referer": f"{OPENAI_AUTH}/email-verification",
-                        "user-agent": self.user_agent,
-                    },
-                    allow_redirects=True,
-                )
-            if "password" in continue_url.lower():
-                password_result = self._register_password(email, password)
-                self.log("ChatGPT 登录密码设置成功")
-                password_continue_url = str(password_result.get("continue_url") or "").strip()
-                if password_continue_url:
-                    self.session.get(
-                        urljoin(OPENAI_AUTH, password_continue_url),
-                        headers={
-                            "referer": f"{OPENAI_AUTH}/create-account/password",
-                            "user-agent": self.user_agent,
-                        },
-                        allow_redirects=True,
-                    )
-            name, birthdate = _random_profile()
-            created = self._create_account(name, birthdate)
-            self.log("ChatGPT 账号资料创建成功")
-            callback_url = str(created.get("continue_url") or "").strip()
+            self._initialize_signup(email, registration=True)
+            authorization = self._submit_signup_email(email)
+            created = self._create_account_from_authorization(
+                email=email,
+                password=password,
+                authorization=authorization,
+            )
+            callback_url = _authorization_continue_url(created)
             if callback_url:
                 self.session.get(
                     urljoin(OPENAI_AUTH, callback_url),
@@ -754,7 +1372,173 @@ class ChatGPTProtocolRegister:
                     allow_redirects=True,
                 )
             result = self._session_result(email, password)
-            self.log("ChatGPT 协议注册完成并已获取 session")
+            self.log("ChatGPT Web 兼容注册完成")
+            return result
+        finally:
+            try:
+                self.sentinel.close()
+            except Exception:
+                pass
+            try:
+                self.session.close()
+            except Exception:
+                pass
+
+    def _create_account_from_authorization(
+        self,
+        *,
+        email: str,
+        password: str,
+        authorization: dict,
+    ) -> dict:
+        page_type = _authorization_page_type(authorization)
+        continue_url = _authorization_continue_url(authorization)
+        password_registered = False
+        otp_completed = False
+        # ``authorize/continue`` and ``user/register`` currently dispatch the
+        # OTP when their response enters the email-verification state. Calling
+        # ``email-otp/send`` again invalidates the transaction and validation
+        # fails with ``invalid_state`` even though the second email arrives.
+        otp_already_dispatched = _email_otp_step(page_type, continue_url)
+
+        for _ in range(6):
+            self._check_cancelled()
+            if _password_registration_step(page_type, continue_url):
+                self._visit_auth_step(
+                    continue_url or "/create-account/password",
+                    referer="/create-account",
+                )
+                password_result = self._register_password(email, password)
+                self._direct_registration_mutated = True
+                password_registered = True
+                page_type = _authorization_page_type(password_result)
+                continue_url = _authorization_continue_url(password_result)
+                otp_already_dispatched = _email_otp_step(page_type, continue_url)
+                self.log(f"ChatGPT 密码创建成功: next={page_type or continue_url or 'unknown'}")
+                continue
+
+            if _email_otp_step(page_type, continue_url):
+                if otp_completed:
+                    raise RuntimeError("邮箱验证码校验后仍停留在 OTP 页面")
+                self._visit_auth_step(
+                    continue_url or "/email-verification",
+                    referer="/create-account/password" if password_registered else "/create-account",
+                )
+                if otp_already_dispatched:
+                    self.log("授权状态已自动发送邮箱验证码，跳过重复发码")
+                    otp_already_dispatched = False
+                else:
+                    self._send_otp(continue_url or "/email-verification")
+                code = str(self.otp_callback() or "").strip()
+                self._check_cancelled()
+                if not code:
+                    raise RuntimeError("未收到邮箱验证码")
+                validation = self._validate_otp(code)
+                otp_completed = True
+                page_type = _authorization_page_type(validation)
+                continue_url = _authorization_continue_url(validation)
+                self.log(f"邮箱验证码校验通过: next={page_type or continue_url or 'unknown'}")
+                continue
+
+            normalized_page = str(page_type or "").strip().lower()
+            normalized_url = str(continue_url or "").strip().lower()
+            if normalized_page == "add_phone" or normalized_url.endswith("/add-phone"):
+                # ``add_phone`` is also used as a UI hint in sessions where
+                # the account-creation API still permits completion.  Let the
+                # server-side create_account call make the authoritative
+                # decision instead of rejecting the transaction prematurely.
+                self.log(
+                    "OpenAI 注册返回 add_phone，继续调用 create_account "
+                    "由服务端确认是否强制手机号验证"
+                )
+                break
+            if (
+                normalized_page in {"about_you", "create_account"}
+                or "about-you" in normalized_url
+                or (not normalized_page and not normalized_url and password_registered and otp_completed)
+            ):
+                break
+            raise RuntimeError(
+                f"OpenAI 注册进入未知步骤: {page_type or continue_url or 'unknown'}"
+            )
+        else:
+            raise RuntimeError("OpenAI 注册状态切换次数过多")
+
+        if not otp_completed:
+            raise RuntimeError("OpenAI 注册流程未完成邮箱验证码校验")
+        if not password_registered:
+            self.log("当前 OpenAI 注册状态未要求单独设置密码")
+
+        if continue_url:
+            self._visit_auth_step(continue_url, referer="/email-verification")
+        name, birthdate = _random_profile()
+        created = self._create_account(name, birthdate)
+        self.log("ChatGPT 账号资料创建成功")
+        return created
+
+    def _run_codex_registration(self, *, email: str, password: str) -> dict:
+        oauth_start: OAuthStart | None = None
+        authorization: dict | None = None
+        for bootstrap_attempt in range(2):
+            try:
+                oauth_start = self._initialize_codex_registration(email)
+                authorization = self._submit_signup_email(email)
+                break
+            except ChatGPTCloudflareChallengeError as exc:
+                can_retry = (
+                    bootstrap_attempt < 1
+                    and callable(self.proxy_rotate_callback)
+                    and self._session_factory is not None
+                    and self._rotate_proxy_after_challenge()
+                )
+                if not can_retry:
+                    raise DirectCodexRegistrationUnavailable(str(exc)) from exc
+                self._wait_before_oauth_retry(0.8)
+                self._replace_owned_session()
+            except Exception as exc:
+                if self.cancel_check() or exc.__class__.__name__ == "ChatGPTAccountBannedDuringRelogin":
+                    raise
+                raise DirectCodexRegistrationUnavailable(str(exc)) from exc
+        if oauth_start is None or authorization is None:
+            raise DirectCodexRegistrationUnavailable(
+                "Codex OAuth registration bootstrap did not complete"
+            )
+
+        created = self._create_account_from_authorization(
+            email=email,
+            password=password,
+            authorization=authorization,
+        )
+        self.log("ChatGPT 账号资料创建成功，继续同一 Codex OAuth 事务")
+        tokens = self._complete_codex_registration_oauth(
+            oauth_start,
+            email=email,
+            continue_url=_authorization_continue_url(created),
+        )
+        return self._codex_registration_result(email, password, tokens)
+
+
+    def run(self, *, email: str, password: str) -> dict:
+        if not str(email or "").strip():
+            raise RuntimeError("协议注册缺少邮箱")
+        if not callable(self.otp_callback):
+            raise RuntimeError("协议注册缺少邮箱验证码回调")
+        self._check_cancelled()
+        self._direct_registration_mutated = False
+        self.log(f"开始 ChatGPT Web 协议注册并获取 Codex OAuth token: {email}")
+        try:
+            # Account creation and Codex token issuance are deliberately split
+            # into two OAuth transactions.  Creating an account directly inside
+            # the Codex PKCE transaction currently enters the mandatory
+            # ``add_phone`` step after email OTP validation, while ChatGPT Web's
+            # registration transaction can finish account creation and establish
+            # the session needed by ``_session_result``.  That session is then
+            # exchanged through a fresh Codex OAuth transaction for AT/RT/IDT.
+            result = self._run_legacy_web_registration(email=email, password=password)
+            if str(result.get("refresh_token") or "").strip():
+                self.log("ChatGPT 协议注册完成并获取 Codex OAuth token")
+            else:
+                self.log("ChatGPT 协议注册完成，本账号为正常无 RT 状态")
             return result
         finally:
             try:

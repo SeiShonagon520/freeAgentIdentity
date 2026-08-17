@@ -13,6 +13,7 @@ import { useI18n } from "@/lib/i18n-context";
 import { Button } from "@/components/ui/button";
 import { Save } from "lucide-react";
 import Settings from "@/pages/Settings";
+import ProxyPoolSettings from "@/pages/ProxyPoolSettings";
 
 /* ------------------------------------------------------------------ */
 /*  Tab definitions                                                    */
@@ -255,29 +256,49 @@ export default function SettingsPage({
   setTheme: (t: string) => void;
 }) {
   const { t } = useI18n();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab") || "general";
-  const tab = ["general", "mailbox"].includes(requestedTab)
+  const tab = ["general", "mailbox", "proxy-pool"].includes(requestedTab)
     ? requestedTab
     : "general";
-
-  const configTabs = ["mailbox"];
-  const isConfigTab = configTabs.includes(tab);
 
   // Page title mapping
   const titles: Record<string, string> = {
     general: t("settings.title.general"),
     mailbox: t("settings.title.mailbox"),
+    "proxy-pool": t("settings.title.proxyPool"),
   };
+  const mobileTabs = [
+    { value: "general", label: t("nav.settings.general") },
+    { value: "mailbox", label: t("nav.settings.mailbox") },
+    { value: "proxy-pool", label: t("nav.settings.proxyPool") },
+  ];
 
   return (
     <div className="mx-auto max-w-4xl">
+      <div className="mb-4 flex gap-1 overflow-x-auto border-b border-[var(--border)] md:hidden">
+        {mobileTabs.map(item => (
+          <button
+            key={item.value}
+            onClick={() => setSearchParams({ tab: item.value })}
+            className={cn(
+              "shrink-0 border-b-2 px-3 py-2 text-sm",
+              tab === item.value
+                ? "border-[var(--accent)] text-[var(--accent)]"
+                : "border-transparent text-[var(--text-muted)]",
+            )}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
       <h1 className="mb-6 text-xl font-semibold text-[var(--text-primary)]">
         {titles[tab] || t("settings.title.fallback")}
       </h1>
 
       {tab === "general" && <GeneralTab theme={theme} setTheme={setTheme} />}
-      {isConfigTab && <Settings />}
+      {tab === "mailbox" && <Settings />}
+      {tab === "proxy-pool" && <ProxyPoolSettings />}
     </div>
   );
 }

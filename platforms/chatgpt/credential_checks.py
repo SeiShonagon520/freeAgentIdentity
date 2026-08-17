@@ -8,8 +8,10 @@ banned.
 from __future__ import annotations
 
 import ast
+import base64
 import json
 import math
+import os
 import queue
 import re
 import threading
@@ -27,6 +29,7 @@ from .constants import (
     OAUTH_TOKEN_URL,
     OPENAI_AUTH,
 )
+from .environment_profile import PROTOCOL_CHROME_IMPERSONATE, PROTOCOL_CHROME_VERSION
 from .oauth import OAuthStart, generate_oauth_url, submit_callback_url
 
 
@@ -48,35 +51,144 @@ def _response_text(response: Any, payload: dict[str, Any]) -> str:
     return text[:1_000]
 
 
-_BAN_MARKERS = (
-    "account_deactivated",
-    "account deactivated",
-    "account_suspended",
-    "account suspended",
-    "account_banned",
-    "account banned",
-    '"status":"banned"',
-    '"status": "banned"',
-    '"banned":true',
-    '"banned": true',
-    '"deactivated":true',
-    '"deactivated": true',
-    '"suspended":true',
-    '"suspended": true',
+def _is_cloudflare_challenge_response(response: Any) -> bool:
+    """Distinguish an edge challenge from an OpenAI credential rejection."""
+    try:
+        raw_headers = getattr(response, "headers", {}) or {}
+        headers = {
+            str(key).strip().lower(): str(value or "").strip().lower()
+            for key, value in raw_headers.items()
+        }
+    except Exception:
+        headers = {}
+    if headers.get("cf-mitigated") == "challenge":
+        return True
+
+    content_type = headers.get("content-type", "")
+    try:
+        body = str(getattr(response, "text", "") or "").lower()
+    except Exception:
+        body = ""
+    if "text/html" in content_type and (
+        "<html" in body
+        or "cloudflare" in body
+        or "just a moment" in body
+        or "challenge-platform" in body
+    ):
+        return True
+    return False
+
+
+def _decode_access_token_payload(token: str) -> dict[str, Any]:
+    parts = str(token or "").split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        payload = parts[1] + ("=" * (-len(parts[1]) % 4))
+        decoded = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+    except Exception:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _access_token_expired_locally(token: str) -> bool:
+    payload = _decode_access_token_payload(token)
+    try:
+        expires_at = float(payload.get("exp") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(expires_at and expires_at <= time.time())
+
+
+def _chatgpt_account_id_from_access_token(token: str) -> str:
+    payload = _decode_access_token_payload(token)
+    auth = payload.get("https://api.openai.com/auth")
+    if not isinstance(auth, dict):
+        return ""
+    return str(auth.get("chatgpt_account_id") or "").strip()
+
+
+def _response_detail_code(response: Any) -> str:
+    payload = _response_payload(response)
+    error = payload.get("error")
+    detail = payload.get("detail")
+    candidates = [
+        detail.get("code") if isinstance(detail, dict) else detail,
+        error.get("code") if isinstance(error, dict) else error,
+        payload.get("code"),
+        error.get("type") if isinstance(error, dict) else None,
+        payload.get("type"),
+    ]
+    return next(
+        (str(value).strip() for value in candidates if str(value or "").strip()),
+        "",
+    )
+
+
+_BAN_CODES = frozenset({"account_deactivated", "account_suspended", "account_banned"})
+_BAN_CODE_PATTERN = re.compile(
+    r"(?<![a-z0-9_])(account_(?:deactivated|suspended|banned))(?![a-z0-9_])",
+    re.IGNORECASE,
 )
 
 
 class ChatGPTAccountBannedDuringRelogin(RuntimeError):
     """The saved web-session login flow explicitly reported an account ban."""
 
+    def __init__(self, message: str, *, code: str):
+        super().__init__(message)
+        self.code = str(code or "").strip().lower()
+
+
+def _explicit_ban_code(value: Any) -> str:
+    """Return an exact OpenAI ban code from structured auth data only."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized_key = str(key or "").strip().lower()
+            if normalized_key in {"banned", "deactivated", "suspended"} and child is True:
+                return f"account_{normalized_key}"
+            code = _explicit_ban_code(child)
+            if code:
+                return code
+        return ""
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            code = _explicit_ban_code(child)
+            if code:
+                return code
+        return ""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    normalized = text.lower()
+    if normalized in _BAN_CODES:
+        return normalized
+    if text[:1] in {"{", "["}:
+        try:
+            return _explicit_ban_code(json.loads(text))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+    match = _BAN_CODE_PATTERN.search(text)
+    return str(match.group(1) or "").lower() if match else ""
+
+
+def _text_has_explicit_ban_marker(value: Any) -> bool:
+    return bool(_explicit_ban_code(value))
+
 
 def _has_explicit_ban_marker(response: Any, payload: dict[str, Any] | None = None) -> bool:
-    text = _response_text(response, payload or {}).lower()
-    return any(marker in text for marker in _BAN_MARKERS)
+    resolved = payload if payload is not None else _response_payload(response)
+    return bool(_explicit_ban_code(resolved))
 
 
 def _is_invalid_refresh_response(status_code: int, payload: dict[str, Any], text: str) -> bool:
-    """Return true only for OAuth's explicit invalid-refresh-token response."""
+    """Return true when the saved refresh credential must be renewed."""
+    # For account maintenance, OpenAI HTTP 403 is a stale-credential signal:
+    # retry the account through the protocol login flow to mint a fresh AT.
+    if status_code == 403:
+        return True
     if status_code != 400:
         return False
     error = str(payload.get("error") or "").strip().lower()
@@ -116,7 +228,8 @@ _OAUTH_PAGE_HEADERS = {
     "accept-language": "en-US,en;q=0.9",
     "user-agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{PROTOCOL_CHROME_VERSION}.0.0.0 Safari/537.36"
     ),
 }
 _OAUTH_JSON_HEADERS = {
@@ -125,6 +238,24 @@ _OAUTH_JSON_HEADERS = {
     "origin": OPENAI_AUTH,
     "user-agent": _OAUTH_PAGE_HEADERS["user-agent"],
 }
+
+
+MAX_PROTOCOL_LOGIN_CONCURRENCY = 50
+
+
+def protocol_login_concurrency_limit() -> int:
+    raw = os.getenv("CHATGPT_PROTOCOL_LOGIN_CONCURRENCY", "50")
+    try:
+        return min(max(int(raw), 1), MAX_PROTOCOL_LOGIN_CONCURRENCY)
+    except (TypeError, ValueError):
+        return MAX_PROTOCOL_LOGIN_CONCURRENCY
+
+
+_PROTOCOL_LOGIN_SEMAPHORE = threading.BoundedSemaphore(
+    protocol_login_concurrency_limit()
+)
+_PROTOCOL_LOGIN_PROFILE_LOCK = threading.Lock()
+_PROTOCOL_LOGIN_PROFILE_POOL: Any | None = None
 _ROUTER_ENQUEUE_PATTERN = re.compile(
     r'window\.__reactRouterContext\.streamController\.enqueue\(("(?:\\.|[^"\\])*")\)',
     re.DOTALL,
@@ -388,8 +519,12 @@ def _select_existing_auth_session(
         proxies=proxies,
     )
     payload = _response_payload(response)
-    if _has_explicit_ban_marker(response, payload):
-        raise ChatGPTAccountBannedDuringRelogin("网页登录明确提示账号已封禁")
+    ban_code = _explicit_ban_code(payload)
+    if ban_code:
+        raise ChatGPTAccountBannedDuringRelogin(
+            f"网页登录明确返回 {ban_code}",
+            code=ban_code,
+        )
     status = int(getattr(response, "status_code", 0) or 0)
     if status >= 400 or payload.get("error"):
         raise RuntimeError(f"选择已登录账号失败（HTTP {status or '-'}）")
@@ -425,8 +560,12 @@ def _authorization_code_via_account_selection(
             proxies=proxies,
         )
         payload = _response_payload(response)
-        if _has_explicit_ban_marker(response, payload):
-            raise ChatGPTAccountBannedDuringRelogin("网页登录明确提示账号已封禁")
+        ban_code = _explicit_ban_code(payload)
+        if ban_code:
+            raise ChatGPTAccountBannedDuringRelogin(
+                f"网页登录明确返回 {ban_code}",
+                code=ban_code,
+            )
         location = str(
             getattr(response, "headers", {}).get("location") or ""
         ).strip()
@@ -599,8 +738,12 @@ def _authorization_code_from_session(
         response = session.get(current, allow_redirects=False, proxies=proxies)
         location = str(getattr(response, "headers", {}).get("location") or "").strip()
         if not location:
-            if _has_explicit_ban_marker(response, _response_payload(response)):
-                raise ChatGPTAccountBannedDuringRelogin("网页登录明确提示账号已封禁")
+            ban_code = _explicit_ban_code(_response_payload(response))
+            if ban_code:
+                raise ChatGPTAccountBannedDuringRelogin(
+                    f"网页登录明确返回 {ban_code}",
+                    code=ban_code,
+                )
             raise RuntimeError(f"会话未自动授权（HTTP {int(getattr(response, 'status_code', 0) or 0) or '-'}）")
         target = urljoin(current, location)
         if _oauth_callback_target(target, oauth_start):
@@ -642,7 +785,10 @@ def mint_chatgpt_refresh_token_from_session(
     resolved_client_id = str(client_id or CODEX_CLIENT_ID).strip() or CODEX_CLIENT_ID
     proxies = {"http": proxy, "https": proxy} if proxy else None
     owns_session = session is None
-    session = session or requests.Session(impersonate="chrome131", timeout=30)
+    session = session or requests.Session(
+        impersonate=PROTOCOL_CHROME_IMPERSONATE,
+        timeout=30,
+    )
     try:
         # A live registration session already has host/path scoped cookies.
         # Re-adding the flattened snapshot creates domainless duplicates and
@@ -759,7 +905,12 @@ def mint_chatgpt_refresh_token_from_session(
             "tokens": {},
         }
     except ChatGPTAccountBannedDuringRelogin as exc:
-        return {"state": "banned", "message": str(exc), "tokens": {}}
+        return {
+            "state": "banned",
+            "message": str(exc),
+            "confirmed_ban_code": exc.code,
+            "tokens": {},
+        }
     except Exception as exc:
         return {"state": "unknown", "message": f"会话换取 RT 未完成: {exc}", "tokens": {}}
     finally:
@@ -798,7 +949,7 @@ def refresh_chatgpt_tokens(
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             proxies=proxies,
             timeout=max(float(timeout_seconds or 30), 1.0),
-            impersonate="chrome131",
+            impersonate=PROTOCOL_CHROME_IMPERSONATE,
         )
     except Exception as exc:
         return {"state": "unknown", "message": f"RT 校验网络异常: {exc}", "tokens": {}}
@@ -872,9 +1023,15 @@ def _build_protocol_login_otp_callback(
     elif provider_name == "domain_inbucket":
         from core.inbucket_domain_mailbox import InbucketDomainMailbox
 
+        inbucket_api_url = str(
+            os.getenv("CHATGPT_INBUCKET_API_URL")
+            or os.getenv("CHATGPT_LOGIN_INBUCKET_API_URL")
+            or credentials.get("inbucket_api_url")
+            or ""
+        ).strip()
         mailbox = InbucketDomainMailbox(
             domain=str(credentials.get("domain") or ""),
-            api_url=str(credentials.get("inbucket_api_url") or ""),
+            api_url=inbucket_api_url,
         )
     else:
         return None
@@ -921,6 +1078,43 @@ def _build_protocol_login_otp_callback(
     return wait_for_login_code
 
 
+def _next_protocol_login_profile():
+    global _PROTOCOL_LOGIN_PROFILE_POOL
+    with _PROTOCOL_LOGIN_PROFILE_LOCK:
+        if _PROTOCOL_LOGIN_PROFILE_POOL is None:
+            from .environment_profile import FingerprintPool
+
+            _PROTOCOL_LOGIN_PROFILE_POOL = FingerprintPool.from_us_en_desktop()
+        return next(_PROTOCOL_LOGIN_PROFILE_POOL)
+
+
+def _login_with_registration_protocol(
+    email: str,
+    password: str,
+    *,
+    otp_callback: Callable[[], str],
+    proxy: str | None,
+    deadline: float,
+    cancel_check: Callable[[], bool],
+    log_callback: Callable[[str], None] | None,
+    proxy_rotate_callback: Callable[[], str | None] | None = None,
+) -> dict[str, Any]:
+    """Reuse the registration protocol session to log in an existing account."""
+    request_timeout = max(min(deadline - time.monotonic(), 30.0), 1.0)
+    from .protocol_register import ChatGPTProtocolRegister
+
+    worker = ChatGPTProtocolRegister(
+        proxy=proxy,
+        otp_callback=otp_callback,
+        log_fn=log_callback,
+        cancel_check=cancel_check,
+        proxy_rotate_callback=proxy_rotate_callback,
+        request_timeout=request_timeout,
+        profile=_next_protocol_login_profile(),
+    )
+    return worker.login(email=email, password=password)
+
+
 def login_chatgpt_with_protocol(
     email: str,
     password: str,
@@ -929,15 +1123,23 @@ def login_chatgpt_with_protocol(
     proxy: str | None = None,
     timeout_seconds: float = 240,
     cancel_check: Callable[[], bool] | None = None,
+    log_callback: Callable[[str], None] | None = None,
+    proxy_rotate_callback: Callable[[], str | None] | None = None,
 ) -> dict[str, Any]:
     """Obtain fresh credentials through the direct HTTP login protocol."""
     normalized_email = str(email or "").strip()
     normalized_password = str(password or "")
-    if not normalized_email or not normalized_password:
+    if not normalized_email:
+        return {
+            "state": "missing_mailbox",
+            "message": "账号缺少邮箱地址，无法恢复登录",
+            "tokens": {},
+        }
+    if not normalized_password:
         return {"state": "invalid", "message": "账号缺少协议登录所需的邮箱或密码", "tokens": {}}
 
     timeout_seconds = max(float(timeout_seconds or 240), 0.01)
-    deadline = time.monotonic() + timeout_seconds
+    deadline = float("inf")
 
     def user_cancelled() -> bool:
         return bool(cancel_check and cancel_check())
@@ -945,30 +1147,50 @@ def login_chatgpt_with_protocol(
     def stopped() -> bool:
         return user_cancelled() or time.monotonic() >= deadline
 
-    otp_callback = _build_protocol_login_otp_callback(
-        normalized_email,
-        provider_accounts,
-        proxy=proxy,
-        deadline=deadline,
-        cancel_check=user_cancelled,
-    )
-    if otp_callback is None:
-        return {"state": "invalid", "message": "账号缺少可复用的验证邮箱，无法协议登录", "tokens": {}}
-
+    acquired = False
     try:
-        from .protocol_register import ChatGPTProtocolRegister
-
-        worker = ChatGPTProtocolRegister(
+        while not acquired:
+            if user_cancelled():
+                return {"state": "cancelled", "message": "协议登录已取消", "tokens": {}}
+            acquired = _PROTOCOL_LOGIN_SEMAPHORE.acquire(timeout=0.5)
+        deadline = time.monotonic() + timeout_seconds
+        otp_callback = _build_protocol_login_otp_callback(
+            normalized_email,
+            provider_accounts,
             proxy=proxy,
-            otp_callback=otp_callback,
-            cancel_check=stopped,
-            request_timeout=max(min(timeout_seconds, 30.0), 1.0),
+            deadline=deadline,
+            cancel_check=user_cancelled,
         )
-        result = worker.login(email=normalized_email, password=normalized_password)
+        if otp_callback is None:
+            return {
+                "state": "missing_mailbox",
+                "message": "账号缺少可复用的验证邮箱，无法协议登录",
+                "tokens": {},
+            }
+        result = _login_with_registration_protocol(
+            normalized_email,
+            normalized_password,
+            otp_callback=otp_callback,
+            proxy=proxy,
+            deadline=deadline,
+            cancel_check=stopped,
+            log_callback=log_callback,
+            proxy_rotate_callback=proxy_rotate_callback,
+        )
+    except ChatGPTAccountBannedDuringRelogin as exc:
+        return {
+            "state": "banned",
+            "message": f"协议登录明确确认账号已封禁: {exc}",
+            "confirmed_ban_code": exc.code,
+            "tokens": {},
+        }
     except Exception as exc:
         if user_cancelled():
             return {"state": "cancelled", "message": "协议登录已取消", "tokens": {}}
         return {"state": "invalid", "message": f"协议登录失败: {exc}", "tokens": {}}
+    finally:
+        if acquired:
+            _PROTOCOL_LOGIN_SEMAPHORE.release()
 
     if time.monotonic() >= deadline:
         return {
@@ -999,58 +1221,225 @@ def check_chatgpt_access_token(
     access_token: str,
     *,
     proxy: str | None = None,
+    account_id: str = "",
     timeout_seconds: float = 30,
+    browser_fetch: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, str]:
-    """Check whether the saved ChatGPT access token is currently rejected.
+    """Validate an AT via OpenAI API, then optionally inspect workspace state.
 
-    Older registrations commonly have an access token and web session but no
-    OAuth refresh token.  Treat only an actual HTTP 401 as invalid; rate
-    limits, Cloudflare responses, and transient network failures must remain
-    inconclusive rather than being reported as a 401.
+    ``api.openai.com/v1/me`` is the authoritative AT check and is always
+    requested directly. ``chatgpt.com/backend-api/me`` runs only after that
+    succeeds; a transient workspace-check failure never overrides a valid AT.
+
+    When ``browser_fetch`` is supplied (e.g. a camoufox ``page.evaluate``
+    wrapper), requests go through a real browser context so Cloudflare sees a
+    genuine browser fingerprint instead of a protocol client, avoiding the
+    spurious HTTP 403 challenge that curl_cffi hits on ``api.openai.com``.
+    The callable receives ``(url, method, headers, body)`` and returns a dict
+    with at least ``status`` and ``text`` keys.
     """
     token = str(access_token or "").strip()
     if not token:
         return {"state": "missing", "message": "账号未保存可校验的 access token"}
 
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    deadline = time.monotonic() + max(float(timeout_seconds or 30), 1.0)
-    endpoints = (
-        ("me", "https://chatgpt.com/backend-api/me"),
-        ("models", "https://chatgpt.com/backend-api/models"),
-    )
-    observations: list[str] = []
+    if _access_token_expired_locally(token):
+        return {"state": "invalid", "message": "access token JWT exp 已过期"}
 
-    # A newly created account can briefly receive a 403 from /me while the
-    # same bearer token is already accepted by /models. Try both authenticated
-    # endpoints and repeat once without exceeding the caller's timeout budget.
-    for attempt in range(2):
-        for endpoint_name, endpoint_url in endpoints:
+    resolved_account_id = (
+        str(account_id or "").strip()
+        or _chatgpt_account_id_from_access_token(token)
+    )
+    request_headers: dict[str, str] = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    if resolved_account_id:
+        request_headers["ChatGPT-Account-ID"] = resolved_account_id
+
+    deadline = time.monotonic() + max(float(timeout_seconds or 30), 1.0)
+    workspace_proxies = {"http": proxy, "https": proxy} if proxy else None
+
+    def classify_response(response: Any, endpoint_name: str) -> dict[str, Any]:
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        detail_code = _response_detail_code(response)
+        detail_suffix = f"，{detail_code}" if detail_code else ""
+        if 200 <= status_code < 300:
+            return {
+                "state": "valid",
+                "message": f"HTTP {status_code}（{endpoint_name}）",
+                "transient": False,
+                "http_status": status_code,
+            }
+        if status_code == 401:
+            return {
+                "state": "invalid",
+                "message": f"access token 返回 HTTP 401（{endpoint_name}{detail_suffix}）",
+                "transient": False,
+                "http_status": status_code,
+            }
+        if status_code == 402:
+            return {
+                "state": "invalid",
+                "message": f"工作区返回 HTTP 402（{endpoint_name}{detail_suffix}）",
+                "transient": False,
+                "http_status": status_code,
+            }
+        if status_code == 403:
+            if _is_cloudflare_challenge_response(response):
+                return {
+                    "state": "unknown",
+                    "message": f"Cloudflare/地区上游拦截 HTTP 403（{endpoint_name}）",
+                    "transient": True,
+                    "http_status": status_code,
+                }
+            return {
+                "state": "invalid",
+                "message": f"access token 返回 HTTP 403（{endpoint_name}{detail_suffix}）",
+                "transient": False,
+                "http_status": status_code,
+            }
+        if status_code == 429:
+            message = f"HTTP 429 限流（{endpoint_name}）"
+        elif status_code == 503:
+            message = f"HTTP 503 上游服务不可用（{endpoint_name}）"
+        else:
+            message = f"HTTP {status_code or '-'}（{endpoint_name}{detail_suffix}）"
+        return {
+            "state": "unknown",
+            "message": message,
+            "transient": True,
+            "http_status": status_code,
+        }
+
+    def retry_delay_seconds(response: Any, retry_index: int) -> float:
+        try:
+            retry_after = float(
+                (getattr(response, "headers", {}) or {}).get("retry-after") or 0
+            )
+        except (TypeError, ValueError):
+            retry_after = 0
+        if retry_after > 0:
+            return min(retry_after, 15.0)
+        return 0.8 * (2 ** retry_index)
+
+    def probe(
+        endpoint_name: str,
+        endpoint_url: str,
+        *,
+        proxies: dict[str, str] | None,
+        max_retries: int,
+    ) -> dict[str, Any]:
+        last_result: dict[str, Any] = {
+            "state": "unknown",
+            "message": f"{endpoint_name} 无响应",
+            "transient": True,
+            "http_status": 0,
+        }
+        for attempt in range(max_retries + 1):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             try:
-                response = requests.get(
-                    endpoint_url,
-                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                    proxies=proxies,
-                    timeout=max(min(remaining, 30.0), 1.0),
-                    impersonate="chrome131",
-                )
+                if browser_fetch is not None:
+                    # Real browser context (camoufox page) — Cloudflare sees a
+                    # genuine browser fingerprint, no spurious 403 challenge.
+                    result = browser_fetch(
+                        endpoint_url,
+                        method="GET",
+                        headers=request_headers,
+                        body=None,
+                    )
+                    status = int(result.get("status") or 0)
+                    text = str(result.get("text") or "")
+
+                    class _BrowserResponse:
+                        status_code = status
+                        headers = result.get("headers") or {}
+
+                        @property
+                        def text(self):
+                            return text
+
+                        @property
+                        def content(self):
+                            return text
+
+                        def json(self):
+                            import json as _json
+
+                            try:
+                                return _json.loads(text or "")
+                            except Exception:
+                                return {}
+
+                    response = _BrowserResponse()
+                else:
+                    response = requests.get(
+                        endpoint_url,
+                        headers=request_headers,
+                        proxies=proxies,
+                        timeout=max(min(remaining, 30.0), 1.0),
+                        impersonate=PROTOCOL_CHROME_IMPERSONATE,
+                    )
             except Exception as exc:
-                observations.append(f"{endpoint_name}: {exc}")
-                continue
+                detail = str(exc).replace("\n", " ").strip()
+                last_result = {
+                    "state": "unknown",
+                    "message": f"{endpoint_name} 网络错误：{detail[:180]}",
+                    "transient": True,
+                    "http_status": 0,
+                }
+                response = None
+            else:
+                last_result = classify_response(response, endpoint_name)
 
-            status_code = int(getattr(response, "status_code", 0) or 0)
-            if 200 <= status_code < 300:
-                return {"state": "valid", "message": f"access token 可用（{endpoint_name}）"}
-            if status_code == 401:
-                return {"state": "invalid", "message": f"access token 返回 HTTP 401（{endpoint_name}）"}
-            observations.append(f"{endpoint_name}: HTTP {status_code or '-'}")
+            if not last_result.get("transient") or attempt >= max_retries:
+                if attempt > 0:
+                    last_result["message"] = (
+                        f"{last_result.get('message') or endpoint_name}；已自动重试 {attempt} 次"
+                    )
+                return last_result
 
-        if attempt == 0:
+            delay = retry_delay_seconds(response, attempt) if response is not None else 0.8 * (2 ** attempt)
             remaining = deadline - time.monotonic()
-            if remaining > 0:
-                time.sleep(min(2.0, remaining))
+            if remaining <= 0:
+                break
+            time.sleep(min(delay, remaining))
 
-    detail = "；".join(observations[-4:]) or "无响应"
-    return {"state": "unknown", "message": f"401 校验未确认（{detail}）"}
+        return last_result
+
+    primary = probe(
+        "api.openai.com/v1/me",
+        "https://api.openai.com/v1/me",
+        proxies=None,
+        max_retries=2,
+    )
+    if primary.get("state") != "valid":
+        return {
+            "state": str(primary.get("state") or "unknown"),
+            "message": str(primary.get("message") or "AT 验活未确认"),
+        }
+
+    workspace = probe(
+        "chatgpt.com/backend-api/me",
+        "https://chatgpt.com/backend-api/me",
+        proxies=workspace_proxies,
+        max_retries=0,
+    )
+    if workspace.get("state") == "invalid":
+        return {
+            "state": "invalid",
+            "message": str(workspace.get("message") or "工作区不可用"),
+        }
+    if workspace.get("state") == "valid":
+        return {
+            "state": "valid",
+            "message": "access token 可用（api.openai.com/v1/me；工作区正常）",
+        }
+    return {
+        "state": "valid",
+        "message": (
+            "access token 可用（api.openai.com/v1/me）；"
+            f"工作区检查未确认：{str(workspace.get('message') or '无响应')}"
+        ),
+    }

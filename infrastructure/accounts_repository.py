@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from sqlalchemy import func
 from sqlmodel import Session, select
 
 from core.account_display import build_account_display_summary
-from core.db import AccountModel, engine
+from core.db import (
+    AccountCredentialModel,
+    AccountModel,
+    AccountOverviewModel,
+    RegisteredEmailHistoryModel,
+    engine,
+)
 from core.account_graph import (
-    compute_account_stats,
     load_account_graphs,
     matches_status_filter,
     patch_account_graph,
@@ -20,7 +26,6 @@ from domain.accounts import (
     AccountImportLine,
     AccountQuery,
     AccountRecord,
-    AccountStats,
     AccountUpdateCommand,
 )
 
@@ -106,27 +111,76 @@ class AccountsRepository:
 
     def list(self, query: AccountQuery) -> tuple[int, list[AccountRecord]]:
         page = max(query.page, 1)
-        page_size = max(query.page_size, 1)
+        page_size = min(max(query.page_size, 1), 100)
         with Session(engine) as session:
             statement = select(AccountModel)
+            count_statement = select(func.count()).select_from(AccountModel)
             if query.platform:
                 statement = statement.where(AccountModel.platform == query.platform)
+                count_statement = count_statement.where(AccountModel.platform == query.platform)
             if query.email:
                 statement = statement.where(AccountModel.email.contains(query.email))
-            statement = statement.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
+                count_statement = count_statement.where(AccountModel.email.contains(query.email))
+            if query.has_refresh_token is not None:
+                refresh_token_account_ids = select(AccountCredentialModel.account_id).where(
+                    AccountCredentialModel.scope == "platform",
+                    AccountCredentialModel.key.in_(("refresh_token", "refreshToken")),
+                    AccountCredentialModel.value != "",
+                )
+                refresh_token_condition = AccountModel.id.in_(refresh_token_account_ids)
+                if query.has_refresh_token:
+                    statement = statement.where(refresh_token_condition)
+                    count_statement = count_statement.where(refresh_token_condition)
+                else:
+                    statement = statement.where(~refresh_token_condition)
+                    count_statement = count_statement.where(~refresh_token_condition)
+            total = int(session.exec(count_statement).one() or 0)
+            statement = (
+                statement
+                .order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
             models = session.exec(statement).all()
             records = self._load_records(session, models)
-            if query.status:
-                records = [item for item in records if matches_status_filter({
-                    "display_status": item.display_status,
-                    "lifecycle_status": item.lifecycle_status,
-                    "plan_state": item.plan_state,
-                    "validity_status": item.validity_status,
-                }, query.status)]
-        total = len(records)
-        start = (page - 1) * page_size
-        end = start + page_size
-        return total, records[start:end]
+        return total, records
+
+    def survival_stats(self, platform: str) -> dict[str, int | float | str]:
+        normalized_platform = str(platform or "").strip().lower()
+        with Session(engine) as session:
+            historical_statement = select(func.count()).select_from(RegisteredEmailHistoryModel)
+            alive_statement = (
+                select(func.count())
+                .select_from(AccountOverviewModel)
+                .join(AccountModel, AccountModel.id == AccountOverviewModel.account_id)
+                .where(
+                    func.lower(
+                        func.coalesce(
+                            func.json_extract(
+                                AccountOverviewModel.summary_json,
+                                "$.refresh_token_status",
+                            ),
+                            "",
+                        )
+                    ) == "valid"
+                )
+            )
+            if normalized_platform:
+                historical_statement = historical_statement.where(
+                    RegisteredEmailHistoryModel.platform == normalized_platform
+                )
+                alive_statement = alive_statement.where(
+                    AccountModel.platform == normalized_platform
+                )
+            historical_count = int(session.exec(historical_statement).one() or 0)
+            alive_count = int(session.exec(alive_statement).one() or 0)
+        survival_rate = round(alive_count / historical_count * 100, 2) if historical_count else 0.0
+        return {
+            "platform": normalized_platform,
+            "alive_accounts": alive_count,
+            "historical_registered_emails": historical_count,
+            "survival_rate": survival_rate,
+        }
 
     def get(self, account_id: int) -> AccountRecord | None:
         with Session(engine) as session:
@@ -292,29 +346,3 @@ class AccountsRepository:
                 )
             session.commit()
         return created
-
-    def stats(self) -> AccountStats:
-        with Session(engine) as session:
-            accounts = session.exec(select(AccountModel).order_by(AccountModel.created_at.desc(), AccountModel.id.desc())).all()
-            records = self._load_records(session, accounts)
-        stats = compute_account_stats(
-            [
-                {
-                    "lifecycle_status": item.lifecycle_status,
-                    "plan_state": item.plan_state,
-                    "validity_status": item.validity_status,
-                    "display_status": item.display_status,
-                }
-                for item in records
-            ],
-            [item.platform for item in records],
-        )
-        return AccountStats(
-            total=len(records),
-            by_platform=stats["by_platform"],
-            by_status=stats["by_display_status"],
-            by_lifecycle_status=stats["by_lifecycle_status"],
-            by_plan_state=stats["by_plan_state"],
-            by_validity_status=stats["by_validity_status"],
-            by_display_status=stats["by_display_status"],
-        )

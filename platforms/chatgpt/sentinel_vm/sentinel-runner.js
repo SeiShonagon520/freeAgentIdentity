@@ -743,7 +743,14 @@ function createBrowserContext(options) {
   };
 }
 
-async function main(argv = process.argv.slice(2), writeOutput = true, inMemoryChallenge = null) {
+function precompileSdk(sdkPath) {
+  const code = fs.readFileSync(sdkPath, "utf8");
+  // debugDx 替换不适用于预编译场景；生产环境通常不会开 debugDx。
+  // 如果开了 debugDx，main() 会回退到动态编译。
+  return new vm.Script(code, { filename: sdkPath });
+}
+
+async function main(argv = process.argv.slice(2), writeOutput = true, inMemoryChallenge = null, compiledSdk = null) {
   const args = readArgs(argv);
   if (args.help === "1" || args.h === "1") {
     const helpText = [
@@ -821,7 +828,7 @@ async function main(argv = process.argv.slice(2), writeOutput = true, inMemoryCh
         args["user-agent"],
         cfg("userAgent", "user_agent"),
         process.env.SENTINEL_USER_AGENT,
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
       ),
     contentType,
     language: pick(args.language, cfg("language"), process.env.SENTINEL_LANGUAGE, "en-US"),
@@ -879,12 +886,22 @@ async function main(argv = process.argv.slice(2), writeOutput = true, inMemoryCh
   };
 
   const { context, clearTimers } = createBrowserContext(options);
-  let sdkCode = fs.readFileSync(sdkPath, "utf8");
-  if (debugDx) {
-    sdkCode = sdkCode.replace(
-      "Cn.set(n,Cn.get(e)[Cn.get(r)].bind(Cn[t(24)](e)))",
-      "(()=>{const __o=Cn.get(e),__p=Cn.get(r);if(!__o||!__o[__p])console.error('[dx bind missing]',typeof __o,__p,Object.prototype.toString.call(__o));return Cn.set(n,__o[__p].bind(__o))})()"
-    );
+
+  // Pre-compiled SDK（sentinel-server.js 在启动时编译一次）复用 vm.Script，
+  // 省掉每次请求的 fs.readFileSync + V8 编译开销（~3-5ms/次）。
+  // debugDx 模式下不能复用预编译脚本（需要字符串替换），回退动态编译。
+  let sdkScript;
+  if (compiledSdk && !debugDx) {
+    sdkScript = compiledSdk;
+  } else {
+    let sdkCode = fs.readFileSync(sdkPath, "utf8");
+    if (debugDx) {
+      sdkCode = sdkCode.replace(
+        "Cn.set(n,Cn.get(e)[Cn.get(r)].bind(Cn[t(24)](e)))",
+        "(()=>{const __o=Cn.get(e),__p=Cn.get(r);if(!__o||!__o[__p])console.error('[dx bind missing]',typeof __o,__p,Object.prototype.toString.call(__o));return Cn.set(n,__o[__p].bind(__o))})()"
+      );
+    }
+    sdkScript = new vm.Script(sdkCode, { filename: sdkPath });
   }
   // 在 sdk 前注入 JSON.parse 探针，覆盖 vm 真正的全局 JSON
   if (process.env.SENTINEL_PROBE_JSON === "1") {
@@ -1062,7 +1079,7 @@ async function main(argv = process.argv.slice(2), writeOutput = true, inMemoryCh
       context, { filename: "probe-verify-1.js" });
   }
 
-  vm.runInContext(sdkCode, context, { filename: sdkPath });
+  sdkScript.runInContext(context);
 
   if (process.env.SENTINEL_PROBE_JSON === "1") {
     try {
@@ -1165,4 +1182,5 @@ if (require.main === module) {
 module.exports = {
   main,
   normalizeChallenge,
+  precompileSdk,
 };

@@ -1,6 +1,10 @@
 services:
   app:
     build: .
+    init: true
+    # Firefox 多 Context 会大量使用 /dev/shm；Docker 默认 64 MiB 容易在高并发下
+    # 触发页面崩溃。该空间按需使用，不会预占 2 GiB 物理内存。
+    shm_size: "2gb"
     depends_on:
       - mihomo
     ports:
@@ -10,12 +14,36 @@ services:
     environment:
       - DISPLAY=:99
       - ACCOUNT_MANAGER_DATABASE_URL=sqlite:////app/data/account_manager.db
+      - MICROSOFT_MAILBOX_ENCRYPTION_KEY=${MICROSOFT_MAILBOX_ENCRYPTION_KEY:-}
+      - MICROSOFT_MAILBOX_ENCRYPTION_KEY_FILE=/app/data/.microsoft_mailbox.key
       - APP_PASSWORD=${APP_PASSWORD:-}
+      # 验证码收信走老机子 inbucket（新服务器不部署 inbucket）
+      - CHATGPT_INBUCKET_API_URL=${CHATGPT_INBUCKET_API_URL:-}
+      - APP_RUNTIME_MODE=${APP_RUNTIME_MODE:-server}
+      # 共享浏览器池：4 个进程 x 8 contexts = 32 并发。减少 Firefox 主进程
+      # 固定开销，同时保留多进程故障隔离。
+      - BROWSER_POOL_SIZE=${BROWSER_POOL_SIZE:-4}
+      - BROWSER_POOL_MAX_CONTEXTS=${BROWSER_POOL_MAX_CONTEXTS:-8}
+      # 错开页面启动，避免 30 个 Context 同一瞬间抢满 8 核 CPU。
+      - BROWSER_CONTEXT_START_INTERVAL_MS=${BROWSER_CONTEXT_START_INTERVAL_MS:-175}
+      - CHATGPT_BROWSER_BLOCK_IMAGES=${CHATGPT_BROWSER_BLOCK_IMAGES:-1}
+      - CHATGPT_BROWSER_DIAGNOSTICS_DIR=/app/data/browser-diagnostics
       - MIHOMO_CONTROLLER_URL=http://mihomo:9090
+      - MIHOMO_CONFIG_FILE=/app/data/mihomo-config.yaml
+      - MIHOMO_CONFIG_RELOAD_PATH=/root/.config/mihomo/config.yaml
       - MIHOMO_PROXY_URL=http://mihomo:7890
-      - MIHOMO_PROXY_GROUP=REGISTER-US
+      - MIHOMO_PROXY_GROUP=REGISTER-ALL
+      - MIHOMO_SLOT_GROUP_PREFIX=${MIHOMO_SLOT_GROUP_PREFIX:-REGISTER-SLOT-}
+      - MIHOMO_SLOT_PORT_BASE=${MIHOMO_SLOT_PORT_BASE:-7900}
+      - MIHOMO_SLOT_COUNT=${MIHOMO_SLOT_COUNT:-50}
+      - MIHOMO_NODE_COOLDOWN_SECONDS=${MIHOMO_NODE_COOLDOWN_SECONDS:-120}
+      - MIHOMO_CHATGPT_PREFLIGHT_TIMEOUT_SECONDS=${MIHOMO_CHATGPT_PREFLIGHT_TIMEOUT_SECONDS:-12}
+      - MIHOMO_CHATGPT_PREFLIGHT_WORKERS=${MIHOMO_CHATGPT_PREFLIGHT_WORKERS:-12}
       - CHATGPT_SENTINEL_VM_WORKERS=${CHATGPT_SENTINEL_VM_WORKERS:-3}
+      - CHATGPT_PROTOCOL_LOGIN_CONCURRENCY=${CHATGPT_PROTOCOL_LOGIN_CONCURRENCY:-50}
       - CHATGPT_SENTINEL_TIMEZONE=${CHATGPT_SENTINEL_TIMEZONE:-America/New_York}
+      # 0 = 关闭每天 03:00 自动 401 验活（改用手动浏览器验活）
+      - DAILY_401_CHECK_ENABLED=${DAILY_401_CHECK_ENABLED:-1}
       # Profile-aware: the V8 sandbox will receive language/cores/screen
       # from the Python ProtocolEnvironmentProfile, so these defaults are
       # fallbacks only.  Keep them consistent with desktop-us-en-chrome-v1.
@@ -33,6 +61,7 @@ services:
       # - VNC_PASSWORD=changeme
     volumes:
       - ./data:/app/data   # 持久化 SQLite 数据库
+      - ${MIHOMO_CONFIG_PATH:-./deploy/mihomo/config.yaml}:/app/data/mihomo-config.yaml
     networks:
       - default
       - inbucket
@@ -44,7 +73,7 @@ services:
       - "7890"
       - "9090"
     volumes:
-      - ${MIHOMO_CONFIG_PATH:-./deploy/mihomo/config.yaml}:/root/.config/mihomo/config.yaml:ro
+      - ${MIHOMO_CONFIG_PATH:-./deploy/mihomo/config.yaml}:/root/.config/mihomo/config.yaml
       - mihomo-provider-data:/root/.config/mihomo/providers
     restart: unless-stopped
 

@@ -1,5 +1,6 @@
 import {
   BrowserRouter,
+  Navigate,
   NavLink,
   Route,
   Routes,
@@ -9,21 +10,22 @@ import { useEffect, useState } from "react";
 import { getAuthToken, setAuthToken, API, cn } from "@/lib/utils";
 import { I18nProvider, useI18n } from "@/lib/i18n-context";
 import type { TranslationKey } from "@/lib/i18n";
-import Dashboard from "@/pages/Dashboard";
 import Accounts from "@/pages/Accounts";
+import Tasks from "@/pages/Tasks";
 import SettingsPage from "@/pages/SettingsPage";
+import MicrosoftMailboxes from "@/pages/MicrosoftMailboxes";
 import UpdateBanner from "@/components/UpdateBanner";
-import WelcomeDialog from "@/components/WelcomeDialog";
 import {
-  LayoutDashboard,
   Moon,
   Settings as SettingsIcon,
   Sun,
   Monitor,
   Languages,
   Users,
+  ListTodo,
   PanelLeftClose,
   PanelLeft,
+  Inbox,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -41,11 +43,13 @@ type NavItem = {
 const SETTINGS_NAV_ITEMS: { labelKey: TranslationKey; hash: string }[] = [
   { labelKey: "nav.settings.general", hash: "general" },
   { labelKey: "nav.settings.mailbox", hash: "mailbox" },
+  { labelKey: "nav.settings.proxyPool", hash: "proxy-pool" },
 ];
 
 const NAV_ITEMS: NavItem[] = [
-  { path: "/", labelKey: "nav.dashboard", icon: LayoutDashboard, exact: true },
   { path: "/accounts/chatgpt", label: "chatgpt free", icon: Users },
+  { path: "/tasks", label: "任务", icon: ListTodo },
+  { path: "/microsoft-mailboxes", label: "微软邮箱", icon: Inbox },
   { path: "/settings", labelKey: "nav.settings", icon: SettingsIcon },
 ];
 
@@ -230,26 +234,39 @@ function Shell({
   const [collapsed, setCollapsed] = useState(
     () => localStorage.getItem("sidebar-collapsed") === "true",
   );
+  const [narrowViewport, setNarrowViewport] = useState(
+    () => window.matchMedia("(max-width: 767px)").matches,
+  );
 
   useEffect(() => {
     localStorage.setItem("sidebar-collapsed", String(collapsed));
   }, [collapsed]);
 
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 767px)");
+    const update = () => setNarrowViewport(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  const sidebarCollapsed = collapsed || narrowViewport;
+
   return (
     <div className="flex h-screen overflow-hidden bg-[var(--bg-base)]">
-      <WelcomeDialog />
       <Sidebar
         theme={theme}
         toggleTheme={toggleTheme}
-        collapsed={collapsed}
+        collapsed={sidebarCollapsed}
         setCollapsed={setCollapsed}
       />
       <main className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-6xl px-6 py-6 lg:px-8">
           <UpdateBanner />
           <Routes>
-            <Route path="/" element={<Dashboard />} />
+            <Route path="/" element={<Navigate to="/accounts/chatgpt" replace />} />
             <Route path="/accounts/chatgpt" element={<Accounts />} />
+            <Route path="/tasks" element={<Tasks />} />
+            <Route path="/microsoft-mailboxes" element={<MicrosoftMailboxes />} />
             <Route
               path="/settings"
               element={<SettingsPage theme={theme} setTheme={setTheme} />}

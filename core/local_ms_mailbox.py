@@ -11,15 +11,11 @@ from __future__ import annotations
 
 import csv
 import email as email_lib
-import hashlib
 import imaplib
-import json
 import re
 import ssl
-import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from email.header import decode_header
 from email.utils import getaddresses
 from pathlib import Path
@@ -155,7 +151,15 @@ def _is_gujumpgate_hotmail_header(parts: list[str]) -> bool:
 
 
 def _looks_like_gujumpgate_hotmail_row(parts: list[str]) -> bool:
-    return len(parts) == 4 and "@" in _safe_text(parts[0]) and bool(_safe_text(parts[2])) and bool(_safe_text(parts[3]))
+    # 卡密导出末尾可能多一个空的 ``----`` 分隔符（变成 5 列），去掉末尾
+    # 空元素后按 4 列判断：邮箱 / 密码 / client_id / refresh_token。
+    trimmed = [p for p in parts if _safe_text(p)]
+    return (
+        len(trimmed) == 4
+        and "@" in _safe_text(parts[0])
+        and bool(_safe_text(parts[2]))
+        and bool(_safe_text(parts[3]))
+    )
 
 
 def parse_local_ms_pool_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
@@ -227,8 +231,6 @@ def parse_xinlan_common_rows(text: str) -> list[LocalMicrosoftMailboxEntry]:
 class LocalMicrosoftMailboxPool(BaseMailbox):
     """Use existing Outlook/Hotmail/Live accounts from a local text pool."""
 
-    _lock = threading.Lock()
-
     def __init__(
         self,
         *,
@@ -237,7 +239,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         state_file: str = "",
         graph_scope: str = "",
         allow_reuse: bool = False,
-        alias_count: int = 1,
+        alias_count: int = 6,
         proxy: str = None,
     ):
         self.pool_text = str(pool_text or "")
@@ -247,6 +249,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         self.allow_reuse = bool(allow_reuse)
         self.alias_count = _bounded_alias_count(alias_count)
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
+        self._legacy_source_imported = False
 
     @classmethod
     def from_config(cls, config: dict) -> "LocalMicrosoftMailboxPool":
@@ -256,7 +259,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             state_file=config.get("local_ms_pool_state_file", ""),
             graph_scope=config.get("local_ms_graph_scope", ""),
             allow_reuse=_truthy(config.get("local_ms_pool_allow_reuse")),
-            alias_count=config.get("local_ms_pool_alias_count", 1),
+            alias_count=config.get("local_ms_pool_alias_count", 6),
             proxy=config.get("proxy") or None,
         )
 
@@ -280,79 +283,87 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             raise RuntimeError("本地微软邮箱池未解析到有效邮箱")
         return entries
 
-    def _state(self) -> dict:
-        try:
-            return json.loads(self.state_file.read_text(encoding="utf-8"))
-        except Exception:
-            return {"used": {}}
-
-    def _save_state(self, state: dict) -> None:
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    def _source_id(self) -> str:
-        material = f"{self.pool_file}\n{self.pool_text}".encode("utf-8")
-        return hashlib.sha256(material).hexdigest()[:16]
-
-    def _candidate_email(self, entry: LocalMicrosoftMailboxEntry, alias_index: int) -> str:
-        if self.alias_count <= 1:
-            return entry.email
+    def _candidate_email(self, entry: LocalMicrosoftMailboxEntry) -> str:
+        # Every registration gets its own random sub-address (local+tag@domain)
+        # that delivers into the parent inbox.  The bare parent address is
+        # never handed out: a parent inbox receives every sibling's mail, so a
+        # worker on the parent reads another (or a stale) OTP and fails with
+        # wrong_email_otp_code.  The tag is a random string (<= 6 chars) instead
+        # of a predictable regN sequence, which OpenAI flags across siblings.
         local_part, separator, domain = entry.email.strip().rpartition("@")
         if not separator or not local_part or not domain:
             raise RuntimeError(f"Outlook 邮箱格式无效，无法生成子邮箱: {entry.email}")
-        # Microsoft Outlook plus addressing delivers local+tag@domain into the
-        # parent mailbox.  Strip a pre-existing tag so all six child addresses
-        # consistently point to the same parent inbox.
+        import random
+        import string
+
         parent_local_part = local_part.split("+", 1)[0]
-        return f"{parent_local_part}+reg{alias_index}@{domain}"
+        tag = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        return f"{parent_local_part}+{tag}@{domain}"
 
-    def _candidates(self) -> list[LocalMicrosoftMailboxCandidate]:
-        candidates: list[LocalMicrosoftMailboxCandidate] = []
-        for entry in self._entries():
-            for alias_index in range(1, self.alias_count + 1):
-                email = self._candidate_email(entry, alias_index)
-                key = entry.key if self.alias_count <= 1 else f"{entry.key}#sub-{alias_index}"
-                candidates.append(
-                    LocalMicrosoftMailboxCandidate(
-                        entry=entry,
-                        email=email,
-                        key=key,
-                        alias_index=alias_index if self.alias_count > 1 else 0,
-                    )
-                )
-        return candidates
+    @staticmethod
+    def _entry_from_record(record) -> LocalMicrosoftMailboxEntry:
+        return LocalMicrosoftMailboxEntry(
+            email=record.email,
+            password=record.password,
+            login_account=record.login_account,
+            imap_host=record.imap_host,
+            imap_port=record.imap_port,
+            imap_account_type=record.imap_account_type,
+            imap_security=record.imap_security,
+            smtp_host=record.smtp_host,
+            smtp_port=record.smtp_port,
+            smtp_security=record.smtp_security,
+            note=record.note,
+            proxy_mode=record.proxy_mode,
+            proxy=record.proxy,
+            label=record.label,
+            recovery_email=record.recovery_email,
+            recovery_password=record.recovery_password,
+            client_id=record.client_id,
+            refresh_token=record.refresh_token,
+            totp_secret=record.totp_secret,
+            source_format=record.source_format,
+        )
 
-    def _reserve(self, candidate: LocalMicrosoftMailboxCandidate) -> None:
-        if self.allow_reuse:
+    def _repository(self):
+        from infrastructure.microsoft_mailbox_repository import MicrosoftMailboxRepository
+
+        return MicrosoftMailboxRepository()
+
+    def _ensure_legacy_source_imported(self) -> None:
+        if self._legacy_source_imported:
             return
-        state = self._state()
-        used = dict(state.get("used") or {})
-        used[candidate.key] = {
-            "email": candidate.email,
-            "parent_email": candidate.entry.email,
-            "alias_index": candidate.alias_index,
-            "reserved_at": datetime.now(timezone.utc).isoformat(),
-            "source_id": self._source_id(),
-        }
-        state["used"] = used
-        self._save_state(state)
+        self._legacy_source_imported = True
+        if not self.pool_text.strip() and not self.pool_file:
+            return
+        self._repository().import_entries(self._entries(), max_uses=self.alias_count)
 
-    def _available_candidate(self) -> LocalMicrosoftMailboxCandidate:
-        candidates = self._candidates()
-        state = self._state()
-        used = set((state.get("used") or {}).keys())
-        for candidate in candidates:
-            if self.allow_reuse or candidate.key not in used:
-                return candidate
-        raise RuntimeError(f"本地微软邮箱池已用尽: total={len(candidates)}")
+    def _candidate_from_record(self, record, *, reserved: bool) -> LocalMicrosoftMailboxCandidate:
+        entry = self._entry_from_record(record)
+        alias_index = int(record.use_count or 0)
+        if not reserved and not self.allow_reuse:
+            alias_index += 1
+        if self.allow_reuse:
+            alias_index = 1
+        alias_index = min(max(alias_index, 1), int(record.max_uses or self.alias_count))
+        email = self._candidate_email(entry)
+        key = entry.key if int(record.max_uses or 1) <= 1 else f"{entry.key}#sub-{alias_index}"
+        return LocalMicrosoftMailboxCandidate(
+            entry=entry,
+            email=email,
+            key=key,
+            alias_index=alias_index if int(record.max_uses or 1) > 1 else 0,
+        )
 
     def peek_email(self) -> str:
-        return self._available_candidate().email
+        self._ensure_legacy_source_imported()
+        record = self._repository().peek()
+        return self._candidate_from_record(record, reserved=False).email
 
     def get_email(self) -> MailboxAccount:
-        with self._lock:
-            candidate = self._available_candidate()
-            self._reserve(candidate)
+        self._ensure_legacy_source_imported()
+        record = self._repository().reserve(allow_reuse=self.allow_reuse)
+        candidate = self._candidate_from_record(record, reserved=True)
 
         entry = candidate.entry
         credentials = entry.credentials()
@@ -418,6 +429,9 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             )
 
         account_parent_key = self._parent_email_key(account_email)
+        record = self._repository().get_by_parent_email(account_parent_key)
+        if record is not None:
+            return self._entry_from_record(record)
         for entry in self._entries():
             if entry.key == account_email or self._parent_email_key(entry.email) == account_parent_key:
                 return entry
@@ -493,6 +507,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
         if not entry.graph_ready:
             raise RuntimeError(f"微软邮箱缺少 Client Id 或刷新令牌: {entry.email}")
         errors: list[str] = []
+        invalid_grant = False
         strategies = [
             ("entra-common-delegated", GRAPH_TOKEN_URL, {"scope": self.graph_scope}),
             ("entra-consumers-delegated", GRAPH_CONSUMERS_TOKEN_URL, {"scope": self.graph_scope}),
@@ -516,6 +531,12 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 errors.append(f"{name}: request failed: {str(exc)[:200]}")
                 continue
             if response.status_code != 200:
+                try:
+                    error_payload = response.json() or {}
+                except Exception:
+                    error_payload = {}
+                if str(error_payload.get("error") or "").strip().lower() == "invalid_grant":
+                    invalid_grant = True
                 errors.append(f"{name}: HTTP {response.status_code} {response.text[:200]}")
                 continue
             payload = response.json() or {}
@@ -524,15 +545,26 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 return token
             errors.append(f"{name}: missing access_token")
         details = " | ".join(errors) if errors else "no token strategies attempted"
+        if invalid_grant:
+            # invalid_grant is terminal for this refresh token.  Leaving the
+            # row available burns another alias and repeats the same failure
+            # in every future task, so remove the parent mailbox immediately.
+            try:
+                self._repository().disable(entry.email)
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Microsoft refresh_token 已失效，邮箱已禁用: {entry.email}; {details}"
+            )
         raise RuntimeError(f"Microsoft refresh_token 换 access_token 失败: {details}")
 
-    def _graph_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
+    def _graph_messages(self, entry: LocalMicrosoftMailboxEntry, *, limit: int = 25) -> list[dict]:
         token = self._graph_access_token(entry)
         response = requests.get(
             GRAPH_MESSAGES_URL,
             headers={"authorization": f"Bearer {token}", "accept": "application/json"},
             params={
-                "$top": "25",
+                "$top": str(max(int(limit or 25), 1)),
                 "$orderby": "receivedDateTime desc",
                 "$select": "id,subject,bodyPreview,receivedDateTime,from,toRecipients,body",
             },
@@ -555,7 +587,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             conn.starttls(ssl_context=ssl.create_default_context())
         return conn
 
-    def _imap_messages(self, entry: LocalMicrosoftMailboxEntry) -> list[dict]:
+    def _imap_messages(self, entry: LocalMicrosoftMailboxEntry, *, limit: int = 25) -> list[dict]:
         if not entry.imap_ready:
             raise RuntimeError(f"微软邮箱没有可用的 Graph token，也没有 IMAP 收件配置: {entry.email}")
         conn = self._imap_connect(entry)
@@ -565,7 +597,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             conn.select("INBOX", readonly=True)
             _, msg_nums = conn.search(None, "ALL")
             ids = msg_nums[0].split() if msg_nums and msg_nums[0] else []
-            for mid in reversed(ids[-30:]):
+            for mid in reversed(ids[-max(int(limit or 25), 1):]):
                 _, data = conn.fetch(mid, "(RFC822)")
                 if not data or not data[0]:
                     continue

@@ -45,6 +45,7 @@ static/
 
 # Docker 数据
 data/
+deploy/mihomo/config.yaml
 
 # 环境变量
 .env
@@ -71,8 +72,10 @@ docs/REFACTOR-PLAN.md
 
 # Local Codex/tooling artifacts and ad-hoc source bundles
 /.codex-test-tmp/
+/.pytest*/
 /.tools/
 /*.zip
+/diag-*.png
 
 # 敏感文件
 *.har

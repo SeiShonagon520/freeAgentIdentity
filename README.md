@@ -105,6 +105,10 @@ docker compose up -d --build
 
 默认 Web UI 端口为 `8000`。如果部署到公网，请务必设置访问密码。
 
+Docker 会将 SQLite 数据库和微软邮箱加密密钥保存在宿主机的 `data/`
+目录。备份或迁移服务器时必须同时保留 `account_manager.db` 和
+`.microsoft_mailbox.key`；丢失密钥后，已入库的微软邮箱凭据无法解密。
+
 ## 配置说明
 
 常用配置优先在 `设置` 页面完成；也可以按需复制 `.env.example` 为 `.env`，通过环境变量覆盖后端默认值。
@@ -121,6 +125,18 @@ ACCOUNT_MANAGER_DATABASE_URL=sqlite:///./data/account_manager.db
 ```bash
 python -m playwright install chromium
 ```
+
+### 自有域名邮箱注册
+
+若使用自己控制的域名收取注册验证码，可在 `设置 → 邮箱服务` 中配置并启用“自有域名邮箱（IMAP 全收）”，然后在注册弹窗的“验证码邮箱服务”下拉框中选择它。
+
+以 `abaifly.edu.kg` 为例：
+
+- 域名填写 `abaifly.edu.kg`；IMAP 服务器应填写证书匹配的主机名（例如 `mail.abaifly.edu.kg`），不要优先使用裸 IP。
+- 邮局必须把该域名所有未创建收件人的邮件投递到一个 IMAP 收件箱（全收 / catch-all / 通配别名）。登录账号和密码填写这个收件箱的 IMAP 凭据。
+- 使用“测试连接”确认 IMAP 登录和 `INBOX` 可读取后，在注册弹窗中选择本次使用的邮箱服务。
+
+系统会为每次注册生成独立地址，例如 `reg-abcdefghijkl@abaifly.edu.kg`，并按邮件原始收件人匹配验证码，避免并发任务互相读取验证码。
 
 ## 项目结构
 

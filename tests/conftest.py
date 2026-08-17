@@ -36,9 +36,16 @@ def _reset_db():
 
 
 @pytest.fixture()
-def client():
-    """FastAPI TestClient with a clean database."""
+def client(monkeypatch):
+    """FastAPI TestClient without scheduled/background account scans."""
     from main import app
+    from core.lifecycle import lifecycle_manager
+    from core.scheduler import scheduler
+
+    monkeypatch.setattr(scheduler, "start", lambda: None)
+    monkeypatch.setattr(scheduler, "stop", lambda: None)
+    monkeypatch.setattr(lifecycle_manager, "start", lambda: None)
+    monkeypatch.setattr(lifecycle_manager, "stop", lambda: None)
 
     with TestClient(app, raise_server_exceptions=False) as c:
         yield c

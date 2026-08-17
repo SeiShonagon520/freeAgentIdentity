@@ -2,7 +2,14 @@
 import secrets
 from core.base_platform import BasePlatform, Account, AccountStatus, RegisterConfig
 from core.base_mailbox import BaseMailbox
-from core.registration import OtpSpec, ProtocolMailboxAdapter, RegistrationResult
+from core.registration import (
+    BrowserRegistrationAdapter,
+    OtpSpec,
+    ProtocolMailboxAdapter,
+    RegistrationCapability,
+    RegistrationResult,
+)
+from core.registration.helpers import resolve_timeout
 from core.registry import register
 from core.proxy_pool import proxy_pool
 from .environment_profile import FingerprintPool, ProtocolEnvironmentProfile
@@ -39,7 +46,7 @@ class ChatGPTPlatform(BasePlatform):
     name = "chatgpt"
     display_name = "ChatGPT"
     version = "1.0.0"
-    supported_executors = ["protocol"]
+    supported_executors = ["protocol", "headless", "headed"]
     supported_identity_modes = ["mailbox"]
     supported_oauth_providers = []
 
@@ -54,6 +61,10 @@ class ChatGPTPlatform(BasePlatform):
     def __init__(self, config: RegisterConfig = None, mailbox: BaseMailbox = None):
         super().__init__(config)
         self.mailbox = mailbox
+        self._proxy_rotate_callback = None
+
+    def set_proxy_rotate_callback(self, callback) -> None:
+        self._proxy_rotate_callback = callback if callable(callback) else None
 
     def check_valid(self, account: Account) -> bool:
         self._last_check_overview = {}
@@ -171,6 +182,7 @@ class ChatGPTPlatform(BasePlatform):
                 otp_callback=artifacts.otp_callback,
                 log_fn=ctx.log,
                 cancel_check=ctx.platform.is_cancel_requested,
+                proxy_rotate_callback=getattr(ctx.platform, "_proxy_rotate_callback", None),
                 profile=profile,
             )
 
@@ -193,7 +205,85 @@ class ChatGPTPlatform(BasePlatform):
                 # discarded.
                 keyword="",
                 wait_message="等待邮箱验证码...",
-                timeout=180,
+                # The pulse controller's ban probe injects a shorter
+                # ``extra["otp_timeout"]`` so a blocked node is identified in
+                # seconds instead of the full worker window.
+                timeout=resolve_timeout(self.config.extra or {}, ("otp_timeout",), 180),
+            ),
+        )
+
+    def build_browser_registration_adapter(self):
+        """Camoufox 浏览器注册适配器，流程与协议一致：密码 + 邮箱 OTP + 姓名生日。
+
+        * ``headed``：独立 camoufox 浏览器（sync），可人工观察/调试。
+        * ``headless``：共享浏览器进程池（async），批量注册省内存。
+        """
+        from platforms.chatgpt.browser_register import ChatGPTBrowserRegister
+
+        def _log(ctx):
+            def _emit(message, **kwargs):
+                # RegistrationContext.log 只接受 message；吞掉 level 等 kwargs
+                ctx.log(str(message))
+            return _emit
+
+        def _build_worker(ctx, artifacts):
+            headless = str(getattr(ctx.config, "executor_type", "") or "") == "headless"
+
+            if headless:
+                from platforms.chatgpt.browser_pool import get_shared_pool
+
+                pool = get_shared_pool(headless=True)
+                proxy = ctx.proxy
+
+                class _PoolWorker:
+                    def run(self, email: str, password: str) -> dict:
+                        return pool.register(
+                            email=email,
+                            password=password,
+                            proxy=proxy,
+                            proxy_rotate_callback=getattr(
+                                ctx.platform, "_proxy_rotate_callback", None
+                            ),
+                            max_proxy_attempts=max(
+                                int(
+                                    (getattr(ctx.config, "extra", {}) or {}).get(
+                                        "browser_proxy_attempts", 6
+                                    )
+                                    or 6
+                                ),
+                                1,
+                            ),
+                            otp_callback=artifacts.otp_callback or (lambda: ""),
+                            log_fn=_log(ctx),
+                        )
+
+                return _PoolWorker()
+
+            return ChatGPTBrowserRegister(
+                headless=False,
+                proxy=ctx.proxy,
+                otp_callback=artifacts.otp_callback,
+                log_fn=_log(ctx),
+            )
+
+        return BrowserRegistrationAdapter(
+            result_mapper=lambda ctx, result: self._map_chatgpt_result(
+                result,
+                password=ctx.password or "",
+            ),
+            browser_worker_builder=_build_worker,
+            browser_register_runner=lambda worker, ctx, artifacts: worker.run(
+                email=ctx.identity.email or "",
+                password=ctx.password or "",
+            ),
+            capability=RegistrationCapability(
+                browser_mailbox_requires_email=True,
+                browser_mailbox_requires_mailbox=True,
+            ),
+            otp_spec=OtpSpec(
+                keyword="",
+                wait_message="等待邮箱验证码...",
+                timeout=resolve_timeout(self.config.extra or {}, ("otp_timeout",), 180),
             ),
         )
 

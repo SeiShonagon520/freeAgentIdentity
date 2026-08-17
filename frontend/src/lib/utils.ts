@@ -35,6 +35,22 @@ export async function apiFetch(path: string, opts?: RequestInit) {
   return res.json()
 }
 
+export async function apiForm(path: string, form: FormData, opts?: RequestInit) {
+  const res = await fetch(API + path, {
+    ...opts,
+    method: opts?.method || 'POST',
+    body: form,
+    headers: { ...authHeaders(), ...(opts?.headers || {}) },
+  })
+  if (res.status === 401 && !path.startsWith('/auth/')) {
+    setAuthToken('')
+    window.location.reload()
+    throw new Error('Unauthorized')
+  }
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
 export async function apiDownload(path: string, opts?: RequestInit) {
   const res = await fetch(API + path, {
     ...opts,

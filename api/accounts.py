@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -68,17 +68,23 @@ def _stream_artifact(artifact: ExportArtifact) -> StreamingResponse:
 @router.get("")
 def list_accounts(
     platform: str = "",
-    status: str = "",
     email: str = "",
-    page: int = 1,
-    page_size: int = 20,
+    has_refresh_token: bool | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
 ):
-    return service.list_accounts(AccountQuery(platform=platform, status=status, email=email, page=page, page_size=page_size))
+    return service.list_accounts(AccountQuery(
+        platform=platform,
+        email=email,
+        has_refresh_token=has_refresh_token,
+        page=page,
+        page_size=page_size,
+    ))
 
 
-@router.get("/stats")
-def get_stats():
-    return service.get_stats()
+@router.get("/survival-stats")
+def get_account_survival_stats(platform: str = "chatgpt"):
+    return service.survival_stats(platform)
 
 
 @router.post("/export/json")
@@ -206,7 +212,7 @@ def import_accounts(body: ImportRequest):
     return service.import_accounts(body.platform, body.lines)
 
 
-@router.get("/{account_id}")
+@router.get("/{account_id:int}")
 def get_account(account_id: int):
     item = service.get_account(account_id)
     if not item:
@@ -214,7 +220,7 @@ def get_account(account_id: int):
     return item
 
 
-@router.patch("/{account_id}")
+@router.patch("/{account_id:int}")
 def update_account(account_id: int, body: AccountUpdateRequest):
     item = service.update_account(account_id, AccountUpdateCommand(**body.model_dump()))
     if not item:
@@ -222,7 +228,7 @@ def update_account(account_id: int, body: AccountUpdateRequest):
     return item
 
 
-@router.delete("/{account_id}")
+@router.delete("/{account_id:int}")
 def delete_account(account_id: int):
     result = service.delete_account(account_id)
     if not result["ok"]:

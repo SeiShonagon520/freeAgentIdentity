@@ -14,8 +14,20 @@ class TasksQueryService:
             return None
         return self._serialize(item)
 
-    def list_events(self, task_id: str, *, since: int = 0, limit: int = 200) -> dict:
-        items = self.repository.list_events(task_id, since=since, limit=limit)
+    def list_tasks(self, *, task_type: str = "", limit: int = 100, active_only: bool = False) -> dict:
+        return {
+            "items": [
+                self._serialize(item)
+                for item in self.repository.list(task_type=task_type, limit=limit, active_only=active_only)
+            ]
+        }
+
+    def list_events(self, task_id: str, *, since: int = 0, limit: int = 200, tail: int = 0) -> dict:
+        items = (
+            self.repository.list_latest_events(task_id, limit=tail)
+            if tail > 0
+            else self.repository.list_events(task_id, since=since, limit=limit)
+        )
         return {
             "items": [
                 {
@@ -40,6 +52,8 @@ class TasksQueryService:
             "type": item.type,
             "platform": item.platform,
             "status": item.status,
+            "terminal": item.terminal,
+            "cancellable": item.cancellable,
             "progress": item.progress.label,
             "progress_detail": {
                 "current": item.progress.current,
@@ -50,6 +64,7 @@ class TasksQueryService:
             "error_count": item.error_count,
             "errors": item.errors,
             "cashier_urls": item.cashier_urls,
+            "data": item.data,
             "error": item.error,
             "created_at": serialize_datetime(item.created_at),
             "started_at": serialize_datetime(item.started_at),

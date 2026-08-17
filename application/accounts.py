@@ -10,7 +10,6 @@ from domain.accounts import (
     AccountImportLine,
     AccountQuery,
     AccountRecord,
-    AccountStats,
     AccountUpdateCommand,
 )
 from infrastructure.accounts_repository import AccountsRepository
@@ -47,8 +46,12 @@ class AccountsService:
         return {
             "total": total,
             "page": query.page,
-            "items": [self._serialize(item) for item in items],
+            "page_size": query.page_size,
+            "items": [self._serialize_list_item(item) for item in items],
         }
+
+    def survival_stats(self, platform: str) -> dict:
+        return self.repository.survival_stats(platform)
 
     def get_account(self, account_id: int) -> dict | None:
         item = self.repository.get(account_id)
@@ -114,16 +117,31 @@ class AccountsService:
             parsed.append(AccountImportLine(email=email, password=password, extra=extra))
         return {"created": self.repository.import_lines(platform, parsed)}
 
-    def get_stats(self) -> dict:
-        stats: AccountStats = self.repository.stats()
+    @staticmethod
+    def _serialize_list_item(item: AccountRecord) -> dict:
+        overview = dict(item.overview or {})
+        has_refresh_token = any(
+            credential.get("key") in {"refresh_token", "refreshToken"}
+            and bool(str(credential.get("value") or "").strip())
+            for credential in item.credentials
+        )
+        totp_secret = next(
+            (
+                str(credential.get("value") or "").strip()
+                for credential in item.credentials
+                if credential.get("key") == "totp_secret"
+            ),
+            "",
+        )
         return {
-            "total": stats.total,
-            "by_platform": stats.by_platform,
-            "by_status": stats.by_status,
-            "by_lifecycle_status": stats.by_lifecycle_status,
-            "by_plan_state": stats.by_plan_state,
-            "by_validity_status": stats.by_validity_status,
-            "by_display_status": stats.by_display_status,
+            "id": item.id,
+            "platform": item.platform,
+            "email": item.email,
+            "password": item.password,
+            "totp_secret": totp_secret,
+            "refresh_token_status": str(overview.get("refresh_token_status") or "unknown"),
+            "has_refresh_token": has_refresh_token,
+            "created_at": serialize_datetime(item.created_at),
         }
 
     @staticmethod

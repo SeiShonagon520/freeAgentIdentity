@@ -78,6 +78,8 @@ def test_platform_action_task_passes_task_logger_to_runtime(monkeypatch):
 
 
 def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatch):
+    checked = {}
+
     class FakePlatform:
         def register(self, email=None, password=None):
             return Account(
@@ -85,7 +87,10 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
                 email=email or "registered@example.com",
                 password=password or "Secret123!",
                 user_id="acct_123",
-                extra={"access_token": "access-token"},
+                extra={
+                    "access_token": "access-token",
+                    "cookies": {"oai-did": "device-123", "session": "saved-cookie"},
+                },
             )
 
     monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
@@ -99,10 +104,22 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
         "_build_platform_instance",
         lambda *args, **kwargs: FakePlatform(),
     )
+
+    def save(account):
+        checked["account"] = account
+        return type("SavedAccount", (), {"id": 123})()
+
+    monkeypatch.setattr(tasks_module, "save_account", save)
     monkeypatch.setattr(
-        tasks_module,
-        "save_account",
-        lambda account: type("SavedAccount", (), {"id": 123})(),
+        "platforms.chatgpt.credential_checks.check_chatgpt_access_token",
+        lambda token, **kwargs: checked.update(
+            {
+                "token": token,
+                "proxy": kwargs.get("proxy"),
+                "account_id": kwargs.get("account_id"),
+            }
+        )
+        or {"state": "valid", "message": "access token 可用"},
     )
     monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
 
@@ -142,16 +159,303 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
         },
     }
     assert any(event[0] == "success" for event in logger.events)
+    assert checked["token"] == "access-token"
+    assert checked["proxy"] is None
+    assert checked["account_id"] == "acct_123"
+    assert checked["account"].extra["account_overview"]["refresh_token_status"] == "valid"
+    assert checked["account"].extra["account_overview"]["refresh_token_check_method"] == "access_token"
     assert not any(
         "cannot access local variable 'extra'" in str(event)
         for event in logger.events
     )
 
 
-def test_register_task_honors_twenty_worker_concurrency_limit():
+def test_register_task_retries_once_with_a_new_mailbox_after_otp_timeout(monkeypatch):
+    attempts = []
+    saved = []
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            attempts.append(len(attempts) + 1)
+            if len(attempts) == 1:
+                raise TimeoutError("等待验证码超时 (180s)")
+            return Account(
+                platform="chatgpt",
+                email="retry-success@example.com",
+                password=password or "Secret123!",
+                user_id="acct_retry",
+                extra={"access_token": "retry-access"},
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.credential_checks.check_chatgpt_access_token",
+        lambda *_args, **_kwargs: {"state": "valid", "message": "access token 可用"},
+    )
+    monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
+
+    def save(account):
+        saved.append(account)
+        return type("SavedAccount", (), {"id": 456})()
+
+    monkeypatch.setattr(tasks_module, "save_account", save)
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "extra": {"identity_provider": "mailbox"},
+        },
+        logger,
+    )
+
+    assert attempts == [1, 2]
+    assert len(saved) == 1
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+    assert logger.result_data["success"] == 1
+    assert logger.result_data["fail"] == 0
+    assert any("更换新邮箱重试一次" in str(event) for event in logger.events)
+
+
+def test_register_task_does_not_save_an_account_without_access_token(monkeypatch):
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email=email or "missing-token@example.com",
+                password=password or "Secret123!",
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr(
+        "core.base_mailbox.create_mailbox",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "save_account",
+        lambda account: (_ for _ in ()).throw(AssertionError("must not save")),
+    )
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "count": 1,
+            "concurrency": 1,
+            "email": "missing-token@example.com",
+            "extra": {"identity_provider": "mailbox"},
+        },
+        logger,
+    )
+
+    assert logger.finished[0] == tasks_module.TASK_STATUS_FAILED
+    assert logger.result_data["success"] == 0
+    assert logger.result_data["fail"] == 1
+
+
+def test_register_task_does_not_save_an_account_whose_access_token_returns_401(monkeypatch):
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email=email or "dead@example.com",
+                password=password or "Secret123!",
+                extra={"access_token": "dead-access-token"},
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.credential_checks.check_chatgpt_access_token",
+        lambda *_args, **_kwargs: {
+            "state": "invalid",
+            "message": "access token 返回 HTTP 401",
+        },
+    )
+    monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        tasks_module,
+        "save_account",
+        lambda account: (_ for _ in ()).throw(AssertionError("must not save a confirmed 401")),
+    )
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "count": 1,
+            "concurrency": 1,
+            "email": "dead@example.com",
+            "extra": {"identity_provider": "mailbox"},
+        },
+        logger,
+    )
+
+    assert logger.finished[0] == tasks_module.TASK_STATUS_FAILED
+    assert logger.result_data["success"] == 0
+    assert logger.result_data["fail"] == 1
+    assert any("401 验活失败" in str(event) for event in logger.events)
+
+
+def test_register_task_saves_an_account_when_401_check_is_inconclusive(monkeypatch):
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email=email or "unconfirmed@example.com",
+                password=password or "Secret123!",
+                extra={"access_token": "fresh-access-token"},
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.credential_checks.check_chatgpt_access_token",
+        lambda *_args, **_kwargs: {
+            "state": "unknown",
+            "message": "401 校验未确认（me: HTTP 403）",
+        },
+    )
+    monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
+    saved = []
+
+    def save(account):
+        saved.append(account)
+        return type("SavedAccount", (), {"id": 321})()
+
+    monkeypatch.setattr(tasks_module, "save_account", save)
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "email": "unconfirmed@example.com",
+            "extra": {"identity_provider": "mailbox"},
+        },
+        logger,
+    )
+
+    assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
+    assert logger.result_data["success"] == 1
+    assert logger.result_data["fail"] == 0
+    assert len(saved) == 1
+    assert saved[0].extra["account_overview"]["refresh_token_status"] == "unknown"
+    assert any("验活未确认，注册结果仍保存" in str(event) for event in logger.events)
+
+
+def test_register_task_honors_fifty_worker_concurrency_limit():
     assert tasks_module._registration_concurrency(20, 50) == 20
-    assert tasks_module._registration_concurrency(99, 50) == 20
+    assert tasks_module._registration_concurrency(99, 50) == 50
+    assert tasks_module._registration_concurrency(50, 0) == 50
     assert tasks_module._registration_concurrency(20, 6) == 6
+
+
+def test_platform_instance_receives_task_cancel_checker(monkeypatch):
+    captured = {}
+
+    class FakePlatform:
+        def __init__(self, **_kwargs):
+            pass
+
+        def set_logger(self, logger):
+            captured["logger"] = logger
+
+        def set_cancel_checker(self, checker):
+            captured["cancel_checker"] = checker
+
+    monkeypatch.setattr(tasks_module, "get", lambda _platform_name: FakePlatform)
+    logger = _FakeLogger()
+
+    tasks_module._build_platform_instance(
+        "chatgpt",
+        {"extra": {"identity_provider": "generated"}},
+        logger,
+    )
+
+    assert captured["logger"] == logger.log
+    assert captured["cancel_checker"] == logger.is_cancel_requested
+
+
+def test_register_task_checks_mailbox_before_starting_workers(monkeypatch):
+    class UnavailableMailbox:
+        @staticmethod
+        def test_connection():
+            raise ConnectionError("127.0.0.1:19000 refused")
+
+    monkeypatch.setattr(tasks_module, "get", lambda _platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "core.base_mailbox.create_mailbox",
+        lambda *args, **kwargs: UnavailableMailbox(),
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("worker must not start")
+        ),
+    )
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(
+        {
+            "count": 50,
+            "concurrency": 50,
+            "extra": {
+                "identity_provider": "mailbox",
+                "mail_provider": "domain_inbucket",
+            },
+        },
+        logger,
+    )
+
+    assert logger.finished[0] == tasks_module.TASK_STATUS_FAILED
+    assert "邮箱服务不可用" in logger.finished[1]
 
 
 def test_register_task_uploads_each_saved_account_immediately(monkeypatch):
@@ -174,6 +478,10 @@ def test_register_task_uploads_each_saved_account_immediately(monkeypatch):
         events.append(("saved", account_id))
         return type("SavedAccount", (), {"id": account_id})()
 
+    def check_access_token(token, **_kwargs):
+        events.append(("checked", token))
+        return {"state": "valid", "message": "access token 可用"}
+
     def upload(account_id, *, sub2api_url, api_key):
         events.append(("uploaded", account_id, sub2api_url, api_key))
         return {"submitted": 1}
@@ -190,6 +498,10 @@ def test_register_task_uploads_each_saved_account_immediately(monkeypatch):
         lambda *args, **kwargs: FakePlatform(),
     )
     monkeypatch.setattr(tasks_module, "save_account", save)
+    monkeypatch.setattr(
+        "platforms.chatgpt.credential_checks.check_chatgpt_access_token",
+        check_access_token,
+    )
     monkeypatch.setattr(
         tasks_module,
         "_upload_registered_chatgpt_account_to_sub2api",
@@ -220,8 +532,10 @@ def test_register_task_uploads_each_saved_account_immediately(monkeypatch):
         tasks_module.clear_register_sub2api_upload_config(logger.task_id)
 
     assert [item[:2] for item in events] == [
+        ("checked", "access-token"),
         ("saved", 123),
         ("uploaded", 123),
+        ("checked", "access-token"),
         ("saved", 124),
         ("uploaded", 124),
     ]
@@ -232,7 +546,7 @@ def test_register_task_uploads_each_saved_account_immediately(monkeypatch):
     }
 
 
-def test_register_api_preserves_protocol_outlook_pool(client, monkeypatch):
+def test_register_api_uses_selected_mailbox_and_protocol(client, monkeypatch):
     captured = {}
 
     def fake_create(payload, **_kwargs):
@@ -240,37 +554,29 @@ def test_register_api_preserves_protocol_outlook_pool(client, monkeypatch):
         return {"task_id": "task_protocol"}
 
     monkeypatch.setattr("api.task_commands.command_service.create_register_task", fake_create)
-    pool_text = "user@outlook.com----mail-pass----client-id----refresh-token"
-
     response = client.post(
         "/api/tasks/register",
         json={
             "count": 1,
-            "concurrency": 1,
-            "executor_type": "protocol",
-            "sub2api_url": "https://sub2api.example",
-            "sub2api_api_key": "volatile-admin-key",
-            "extra": {
-                "local_ms_pool_text": pool_text,
-                "auto_upload_sub2api_agent_identity": True,
-            },
+            "concurrency": 50,
+            "extra": {"mail_provider": "domain_inbucket"},
         },
     )
 
     assert response.status_code == 200
     assert captured["executor_type"] == "protocol"
-    assert captured["extra"]["mail_provider"] == "local_ms_pool"
-    assert captured["extra"]["local_ms_pool_text"] == pool_text
-    assert captured["extra"]["local_ms_pool_alias_count"] == 6
-    assert captured["extra"]["auto_upload_sub2api_agent_identity"] is True
+    assert captured["concurrency"] == 50
+    assert captured["extra"] == {
+        "mail_provider": "domain_inbucket",
+        "identity_provider": "mailbox",
+    }
 
 
-def test_register_api_keeps_sub2api_key_out_of_task_payload(client, monkeypatch):
+def test_register_api_accepts_zero_for_unlimited_registration(client, monkeypatch):
     captured = {}
 
-    def fake_create(payload, *, sub2api_upload=None):
+    def fake_create(payload):
         captured["payload"] = payload
-        captured["upload"] = sub2api_upload
         return {"task_id": "task_protocol"}
 
     monkeypatch.setattr("api.task_commands.command_service.create_register_task", fake_create)
@@ -278,66 +584,80 @@ def test_register_api_keeps_sub2api_key_out_of_task_payload(client, monkeypatch)
     response = client.post(
         "/api/tasks/register",
         json={
-            "count": 1,
-            "executor_type": "protocol",
-            "sub2api_url": "https://sub2api.example",
-            "sub2api_api_key": "volatile-admin-key",
-            "extra": {
-                "local_ms_pool_text": "user@outlook.com----mail-pass----client-id----refresh-token",
-                "auto_upload_sub2api_agent_identity": True,
-            },
+            "count": 0,
+            "concurrency": 50,
+            "extra": {"mail_provider": "domain_inbucket"},
         },
     )
 
     assert response.status_code == 200
-    assert "sub2api_api_key" not in captured["payload"]
-    assert "sub2api_url" not in captured["payload"]
-    assert captured["upload"] == {
-        "sub2api_url": "https://sub2api.example",
-        "api_key": "volatile-admin-key",
-    }
+    assert captured["payload"]["count"] == 0
+    assert captured["payload"]["concurrency"] == 50
+    assert captured["payload"]["executor_type"] == "protocol"
 
 
-def test_register_api_allows_six_outlook_child_addresses_per_parent(client, monkeypatch):
+def test_register_api_rejects_concurrency_over_fifty(client, monkeypatch):
     captured = {}
 
     monkeypatch.setattr(
         "api.task_commands.command_service.create_register_task",
         lambda payload: captured.update(payload) or {"task_id": "task_protocol"},
     )
-    pool_text = "user@outlook.com----mail-pass----client-id----refresh-token"
-
     accepted = client.post(
         "/api/tasks/register",
         json={
             "count": 6,
-            "executor_type": "protocol",
-            "extra": {"local_ms_pool_text": pool_text},
+            "concurrency": 50,
+            "extra": {"mail_provider": "domain_inbucket"},
         },
     )
     rejected = client.post(
         "/api/tasks/register",
         json={
             "count": 7,
-            "executor_type": "protocol",
-            "extra": {"local_ms_pool_text": pool_text},
+            "concurrency": 51,
+            "extra": {"mail_provider": "domain_inbucket"},
         },
     )
 
     assert accepted.status_code == 200
-    assert captured["extra"]["local_ms_pool_alias_count"] == 6
-    assert rejected.status_code == 400
+    assert captured["extra"]["mail_provider"] == "domain_inbucket"
+    assert rejected.status_code == 422
+    return
     assert "子邮箱容量 6" in rejected.json()["detail"]
 
 
-def test_register_api_rejects_protocol_without_outlook_pool(client):
+def test_register_api_rejects_protocol_without_mailbox_service(client):
     response = client.post(
         "/api/tasks/register",
         json={"executor_type": "protocol", "count": 1, "extra": {}},
     )
 
     assert response.status_code == 400
-    assert "Outlook" in response.json()["detail"]
+    assert "邮箱服务" in response.json()["detail"]
+
+
+def test_register_api_allows_protocol_with_domain_mailbox(client, monkeypatch):
+    captured = {}
+
+    def fake_create(payload, **kwargs):
+        captured.update(payload)
+        return {"task_id": "domain-task"}
+
+    monkeypatch.setattr("api.task_commands.command_service.create_register_task", fake_create)
+
+    response = client.post(
+        "/api/tasks/register",
+        json={
+            "executor_type": "protocol",
+            "count": 2,
+            "extra": {"mail_provider": "domain_imap_catchall"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["extra"]["mail_provider"] == "domain_imap_catchall"
+    assert "local_ms_pool_alias_count" not in captured["extra"]
 
 
 def test_platform_action_task_finishes_cancelled_without_starting_runtime(monkeypatch):

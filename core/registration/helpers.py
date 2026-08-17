@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from .errors import BrowserReuseRequiredError, IdentityResolutionError, RegistrationUnsupportedError
@@ -57,15 +58,35 @@ def build_otp_callback(
 
     def otp_cb():
         ctx.log(wait_message)
-        kwargs = {"keyword": keyword, "before_ids": getattr(ctx.identity, "before_ids", set())}
-        if timeout is not None:
-            kwargs["timeout"] = timeout
-        if code_pattern:
-            kwargs["code_pattern"] = code_pattern
-        code = mailbox.wait_for_code(mail_acct, **kwargs)
-        if code:
-            ctx.log(f"{success_label}: {code}")
-        return code
+        total_timeout = int(timeout if timeout is not None else 120)
+        deadline = time.monotonic() + max(total_timeout, 1)
+        while True:
+            if ctx.platform.is_cancel_requested():
+                raise RuntimeError("任务已取消")
+            remaining = max(1, int(deadline - time.monotonic()))
+            kwargs = {
+                "keyword": keyword,
+                "before_ids": getattr(ctx.identity, "before_ids", set()),
+                # Poll in short windows so stopping a task takes seconds rather
+                # than waiting for the full mailbox timeout.
+                "timeout": min(remaining, 5),
+            }
+            if code_pattern:
+                kwargs["code_pattern"] = code_pattern
+            try:
+                code = mailbox.wait_for_code(mail_acct, **kwargs)
+            except TimeoutError as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"等待验证码超时 ({total_timeout}s)"
+                    ) from exc
+                continue
+            if code:
+                otp_received_callback = ctx.extra.get("_otp_received_callback")
+                if callable(otp_received_callback):
+                    otp_received_callback()
+                ctx.log(f"{success_label}: {code}")
+            return code
 
     return otp_cb
 
