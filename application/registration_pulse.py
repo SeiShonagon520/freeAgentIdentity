@@ -5,8 +5,9 @@ the observable symptom is the mailbox never receiving the verification email
 (the OTP wait times out).  This controller replaces the continuous rolling
 worker pool with discrete synchronized pulses:
 
-* A wave submits up to 50 healthy-node workers simultaneously and waits for
-  the whole wave (``ALL_COMPLETED``) before evaluating it.
+* A wave submits at most the requested concurrency across healthy nodes,
+  applies results as workers finish, and has a hard deadline so one poisoned
+  browser cannot stall every later wave.
 * A worker whose OTP never arrives returns ``_NO_EMAIL_MARKER``.  The
   controller requeues that account index (retry across pulses, never a
   one-worker retry) and, after ``ban_after_consecutive_no_email`` consecutive
@@ -22,7 +23,13 @@ from __future__ import annotations
 
 import threading
 import time
-from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    ALL_COMPLETED,
+    ThreadPoolExecutor,
+    TimeoutError as FuturesTimeoutError,
+    as_completed,
+    wait,
+)
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -47,6 +54,7 @@ DEFAULT_BAN_AFTER_CONSECUTIVE_NO_EMAIL = 3
 # blocked; probing a small rotating batch keeps recovery detection working
 # without the "still sending verification codes" storm.
 DEFAULT_PROBE_BATCH_SIZE = 5
+DEFAULT_PULSE_WAVE_TIMEOUT_SECONDS = 900.0
 
 
 @dataclass(slots=True)
@@ -56,6 +64,8 @@ class PulseConfig:
     probe_otp_timeout_seconds: int = DEFAULT_PROBE_OTP_TIMEOUT_SECONDS
     ban_after_consecutive_no_email: int = DEFAULT_BAN_AFTER_CONSECUTIVE_NO_EMAIL
     probe_batch_size: int = DEFAULT_PROBE_BATCH_SIZE
+    wave_concurrency: int = MAX_REGISTER_CONCURRENCY
+    wave_timeout_seconds: float = DEFAULT_PULSE_WAVE_TIMEOUT_SECONDS
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "PulseConfig":
@@ -99,6 +109,20 @@ class PulseConfig:
                     minimum=1.0,
                     maximum=20.0,
                 )
+            ),
+            wave_concurrency=int(
+                _num(
+                    "concurrency",
+                    MAX_REGISTER_CONCURRENCY,
+                    minimum=1.0,
+                    maximum=float(MAX_REGISTER_CONCURRENCY),
+                )
+            ),
+            wave_timeout_seconds=_num(
+                "pulse_wave_timeout_seconds",
+                DEFAULT_PULSE_WAVE_TIMEOUT_SECONDS,
+                minimum=60.0,
+                maximum=3600.0,
             ),
         )
 
@@ -191,18 +215,47 @@ class PulseRegistration:
                     break
                 time.sleep(0.2)
                 continue
-            # Synchronized burst: all healthy nodes register in parallel and the
-            # wave only advances once ALL workers have settled.  The whole wave
-            # holds ``_slot_lock`` so the probe cycle cannot run concurrently
-            # and fight over the same Mihomo slots.
+            # Synchronized burst: requested workers register in parallel and
+            # results are applied as each one settles.  The whole wave holds
+            # ``_slot_lock`` so the probe cycle cannot run concurrently and
+            # fight over the same Mihomo slots.
             with self._slot_lock:
-                with ThreadPoolExecutor(max_workers=len(indices)) as pool:
-                    futures = [pool.submit(self._run_worker, idx) for idx in indices]
-                    wait(futures, return_when=ALL_COMPLETED)
-                    self._apply_wave_results(futures, indices)
-            self._logger.set_progress(self._consumed, self._count)
+                pool = ThreadPoolExecutor(max_workers=len(indices))
+                futures = {
+                    pool.submit(self._run_worker, index): index for index in indices
+                }
+                no_email_by_node: dict[str, list[int]] = {}
+                node_had_success: set[str] = set()
+                timed_out = False
+                try:
+                    for future in as_completed(
+                        futures,
+                        timeout=self._config.wave_timeout_seconds,
+                    ):
+                        self._apply_wave_result(
+                            future,
+                            futures[future],
+                            no_email_by_node,
+                            node_had_success,
+                        )
+                        self._logger.set_progress(self._consumed, self._count)
+                except FuturesTimeoutError:
+                    timed_out = True
+                    pending = [future for future in futures if not future.done()]
+                    for future in pending:
+                        future.cancel()
+                    self._fatal_error = (
+                        f"注册波次超过 {int(self._config.wave_timeout_seconds)} 秒，"
+                        f"仍有 {len(pending)} 个 worker 未退出"
+                    )
+                    self._logger.log(self._fatal_error, level="error")
+                finally:
+                    pool.shutdown(wait=not timed_out, cancel_futures=timed_out)
+                self._finish_wave_results(no_email_by_node, node_had_success)
             if self._fatal_error:
-                # Mailbox pool exhausted: no more accounts can be created.
+                # Mailbox pool exhausted or a poisoned worker exceeded the hard
+                # wave deadline.  Returning lets task cleanup close the shared
+                # browser pool and release any remaining Playwright calls.
                 break
             if self._done() or self._logger.is_cancel_requested():
                 break
@@ -219,55 +272,64 @@ class PulseRegistration:
         )
         return result, ctx
 
-    def _apply_wave_results(self, futures, indices: list[int]) -> None:
-        no_email_by_node: dict[str, list[int]] = {}
-        node_had_success: set[str] = set()
+    def _apply_wave_result(
+        self,
+        future,
+        index: int,
+        no_email_by_node: dict[str, list[int]],
+        node_had_success: set[str],
+    ) -> None:
         with self._state_lock:
-            for future, index in zip(futures, indices):
-                try:
-                    result, ctx = future.result()
-                except Exception as exc:
-                    result = str(exc) or "worker 内部异常"
-                    ctx = {}
-                node = str(ctx.get("node") or "")
-                if isinstance(result, dict):
-                    self._success += 1
-                    self._consumed += 1
-                    if len(self._registered) < MAX_TASK_ACCOUNT_SUMMARIES:
-                        self._registered.append(result)
-                    if node:
-                        self._allocator.record_success(node)
-                        node_had_success.add(node)
-                elif result == _CANCEL_REQUESTED:
-                    self._cancelled = True
-                elif result == _POOL_EXHAUSTED_MARKER:
-                    # Mailbox pool exhausted: fatal for the whole task, not a
-                    # per-account failure.  Stop scheduling further waves.
-                    if not self._fatal_error:
-                        self._fatal_error = "本地微软邮箱池已用尽，注册任务终止"
-                elif result == _NO_EMAIL_MARKER:
-                    # Account index is NOT consumed; retried in a later wave.
-                    if node:
-                        no_email_by_node.setdefault(node, []).append(index)
-                    else:
-                        # Defensive: without node context we cannot attribute a
-                        # strike, but the index must still be retried.
-                        self._requeue(index)
+            try:
+                result, ctx = future.result()
+            except Exception as exc:
+                result = str(exc) or "worker 内部异常"
+                ctx = {}
+            node = str(ctx.get("node") or "")
+            if isinstance(result, dict):
+                self._success += 1
+                self._consumed += 1
+                if len(self._registered) < MAX_TASK_ACCOUNT_SUMMARIES:
+                    self._registered.append(result)
+                if node:
+                    self._allocator.record_success(node)
+                    node_had_success.add(node)
+            elif result == _CANCEL_REQUESTED:
+                self._cancelled = True
+            elif result == _POOL_EXHAUSTED_MARKER:
+                if not self._fatal_error:
+                    self._fatal_error = "本地微软邮箱池已用尽，注册任务终止"
+            elif result == _NO_EMAIL_MARKER:
+                if node:
+                    no_email_by_node.setdefault(node, []).append(index)
                 else:
-                    self._fail += 1
-                    self._consumed += 1
-                    self._first_error = self._first_error or str(result)
-                    # Cloudflare challenge = the node's egress IP is being
-                    # flagged by CF; ban it outright instead of waiting for a
-                    # no-email strike (the retries inside the worker already
-                    # rotated proxies, so this is the last node actually hit).
-                    if node and "Cloudflare" in str(result):
-                        if node not in self._allocator.banned_nodes():
-                            self._allocator.mark_blocked(node)
-                            self._logger.log(
-                                f"节点 {node} 触发 Cloudflare 挑战失败，直接封禁该节点",
-                                level="warning",
-                            )
+                    self._requeue(index)
+            else:
+                self._fail += 1
+                self._consumed += 1
+                self._first_error = self._first_error or str(result)
+                if any(
+                    marker in str(result)
+                    for marker in (
+                        "共享浏览器事件循环超过",
+                        "共享浏览器池无可用进程",
+                    )
+                ):
+                    self._fatal_error = f"共享浏览器池失去响应，任务终止: {result}"
+                    self._logger.log(self._fatal_error, level="error")
+                if node and "Cloudflare" in str(result):
+                    if node not in self._allocator.banned_nodes():
+                        self._allocator.mark_blocked(node)
+                        self._logger.log(
+                            f"节点 {node} 触发 Cloudflare 挑战失败，直接封禁该节点",
+                            level="warning",
+                        )
+
+    def _finish_wave_results(
+        self,
+        no_email_by_node: dict[str, list[int]],
+        node_had_success: set[str],
+    ) -> None:
         if self._cancelled or self._fatal_error:
             return
         # Requeue every no-email index, then apply per-node ban decisions.
@@ -357,11 +419,25 @@ class PulseRegistration:
         # Serialized with the pulse wave so probes and registrations never
         # compete for the same Mihomo slot pool at the same time.
         with self._slot_lock:
-            with ThreadPoolExecutor(
+            pool = ThreadPoolExecutor(
                 max_workers=min(MAX_REGISTER_CONCURRENCY, len(jobs))
-            ) as pool:
-                futures = [pool.submit(self._run_one_probe, node, index) for node, index in jobs]
-                wait(futures, return_when=ALL_COMPLETED)
+            )
+            futures = [pool.submit(self._run_one_probe, node, index) for node, index in jobs]
+            _, pending = wait(
+                futures,
+                timeout=self._config.wave_timeout_seconds,
+                return_when=ALL_COMPLETED,
+            )
+            timed_out = bool(pending)
+            if timed_out:
+                for future in pending:
+                    future.cancel()
+                self._logger.log(
+                    f"节点探测超过 {int(self._config.wave_timeout_seconds)} 秒，"
+                    f"已放弃等待 {len(pending)} 个探测 worker",
+                    level="error",
+                )
+            pool.shutdown(wait=not timed_out, cancel_futures=timed_out)
 
     def _run_one_probe(self, node: str, index: int) -> None:
         worker_context: dict[str, Any] = {}
@@ -439,12 +515,12 @@ class PulseRegistration:
     # ------------------------------------------------------- index pool/state
 
     def _pop_wave_indices(self, healthy_count: int) -> list[int]:
-        # Wave size is bounded only by the physical Mihomo slot pool, not by
-        # MAX_REGISTER_CONCURRENCY: with one slot per usable node, every healthy
-        # node participates in the wave.
+        # Bound each wave by all three real constraints: requested concurrency,
+        # physical Mihomo slots, and currently healthy nodes.
         wave_cap = min(
             getattr(self._allocator, "slot_count", healthy_count),
             healthy_count,
+            self._config.wave_concurrency,
         )
         with self._state_lock:
             if self._pending is not None:

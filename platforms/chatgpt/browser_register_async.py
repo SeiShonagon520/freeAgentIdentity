@@ -824,7 +824,8 @@ async def _browser_registration_flow(
 
 async def register_in_context(browser, *, email: str, password: str, proxy: str | None,
                               otp_callback: Callable[[], str], log,
-                              startup_gate: asyncio.Semaphore | None = None) -> dict:
+                              startup_gate: asyncio.Semaphore | None = None,
+                              close_timeout_seconds: float = 15.0) -> dict:
     """在共享浏览器进程里开一个独立指纹 context，跑完注册并关闭 context。"""
     context = await AsyncNewContext(
         browser,
@@ -856,9 +857,24 @@ async def register_in_context(browser, *, email: str, password: str, proxy: str 
             await _capture_failure(page, reason=str(exc), log=log)
             raise
     finally:
+        close_task = None
         try:
-            await context.close()
+            close_task = asyncio.create_task(context.close())
+            done, _ = await asyncio.wait(
+                {close_task},
+                timeout=max(float(close_timeout_seconds or 0), 0.1),
+            )
+            if not done:
+                close_task.cancel()
+                log(
+                    "浏览器 context 关闭超时，已放弃等待关闭响应",
+                    level="warning",
+                )
+            else:
+                close_task.result()
         except Exception:
+            if close_task is not None and not close_task.done():
+                close_task.cancel()
             pass
 
 

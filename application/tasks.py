@@ -1036,9 +1036,9 @@ def _run_pulse_registration(
 ) -> None:
     """Run a register task in synchronized pulses with per-node ban probes.
 
-    Each wave fires up to 50 healthy nodes concurrently (the user's
-    ``concurrency`` knob only bounds the non-pulse path); the controller is
-    responsible for sizing waves, pausing banned nodes, and running probes.
+    Each wave respects the requested ``concurrency`` and the available healthy
+    node/slot count.  The controller is responsible for sizing waves, pausing
+    banned nodes, applying worker results as they finish, and running probes.
     """
     from application.registration_pulse import PulseConfig, PulseRegistration
 

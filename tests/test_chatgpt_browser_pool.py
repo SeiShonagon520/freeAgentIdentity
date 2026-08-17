@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
+
+import pytest
 
 from platforms.chatgpt import browser_pool, browser_register_async, browser_verify
 from platforms.chatgpt.browser_register_async import (
@@ -110,6 +113,74 @@ def test_browser_pool_rotates_proxy_and_opens_a_fresh_context(monkeypatch):
     assert proxies == ["http://slot-1:7901", "http://slot-2:7902"]
 
 
+def test_browser_pool_times_out_and_recycles_a_stuck_browser(monkeypatch):
+    _FakeAsyncManager.instances.clear()
+    monkeypatch.setattr(browser_pool, "AsyncCamoufox", _FakeAsyncManager)
+
+    async def stuck_register(_browser, **_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(browser_pool, "register_in_context", stuck_register)
+    logs = []
+    pool = browser_pool.BrowserProcessPool(
+        headless=True,
+        pool_size=1,
+        max_contexts_per_browser=1,
+        registration_timeout_seconds=0.05,
+        context_close_timeout_seconds=0.01,
+        browser_recycle_timeout_seconds=0.2,
+    )
+    started_at = time.monotonic()
+    try:
+        with pytest.raises(browser_pool.BrowserRegistrationTimeoutError):
+            pool.register(
+                email="stuck@example.com",
+                password="password",
+                proxy=None,
+                otp_callback=lambda: "123456",
+                log_fn=lambda message, **kwargs: logs.append((message, kwargs)),
+            )
+    finally:
+        pool.shutdown()
+
+    assert time.monotonic() - started_at < 2
+    assert len(_FakeAsyncManager.instances) == 2
+    assert all(manager.exited == 1 for manager in _FakeAsyncManager.instances)
+    assert any("重建卡死浏览器" in message for message, _ in logs)
+    assert any("已重建" in message for message, _ in logs)
+
+
+def test_browser_pool_preserves_a_real_otp_timeout(monkeypatch):
+    _FakeAsyncManager.instances.clear()
+    monkeypatch.setattr(browser_pool, "AsyncCamoufox", _FakeAsyncManager)
+
+    async def otp_timeout(_browser, **_kwargs):
+        raise TimeoutError("等待验证码超时: 180 秒")
+
+    monkeypatch.setattr(browser_pool, "register_in_context", otp_timeout)
+    pool = browser_pool.BrowserProcessPool(
+        headless=True,
+        pool_size=1,
+        max_contexts_per_browser=1,
+    )
+    try:
+        with pytest.raises(TimeoutError, match="等待验证码超时") as exc_info:
+            pool.register(
+                email="otp@example.com",
+                password="password",
+                proxy=None,
+                otp_callback=lambda: "",
+                log_fn=lambda *_args, **_kwargs: None,
+            )
+    finally:
+        pool.shutdown()
+
+    assert not isinstance(
+        exc_info.value,
+        browser_pool.BrowserRegistrationTimeoutError,
+    )
+
+
 def test_async_registration_context_uses_lightweight_headless_options(monkeypatch):
     captured = {}
 
@@ -147,6 +218,43 @@ def test_async_registration_context_uses_lightweight_headless_options(monkeypatc
     assert captured["reduced_motion"] == "reduce"
     assert captured["service_workers"] == "block"
     assert captured["closed"] is True
+
+
+def test_async_registration_context_close_has_a_hard_timeout(monkeypatch):
+    logs = []
+
+    class Context:
+        async def new_page(self):
+            return object()
+
+        async def close(self):
+            await asyncio.Event().wait()
+
+    async def fake_new_context(_browser, **_kwargs):
+        return Context()
+
+    async def fake_flow(*_args, **_kwargs):
+        return {"access_token": "token"}
+
+    monkeypatch.setattr(browser_register_async, "AsyncNewContext", fake_new_context)
+    monkeypatch.setattr(browser_register_async, "_browser_registration_flow", fake_flow)
+
+    started_at = time.monotonic()
+    result = asyncio.run(
+        browser_register_async.register_in_context(
+            object(),
+            email="user@example.com",
+            password="password",
+            proxy=None,
+            otp_callback=lambda: "123456",
+            log=lambda message, **kwargs: logs.append((message, kwargs)),
+            close_timeout_seconds=0.01,
+        )
+    )
+
+    assert result["access_token"] == "token"
+    assert time.monotonic() - started_at < 1
+    assert any("context 关闭超时" in message for message, _ in logs)
 
 
 def test_browser_fetch_session_exits_the_camoufox_manager(monkeypatch):

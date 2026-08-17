@@ -33,7 +33,8 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from camoufox.async_api import AsyncCamoufox
@@ -66,6 +67,21 @@ _DEFAULT_STARTUP_CONCURRENCY = _env_int(
     minimum=1,
 )
 _DEFAULT_BLOCK_IMAGES = _env_bool("CHATGPT_BROWSER_BLOCK_IMAGES", True)
+_DEFAULT_REGISTER_TIMEOUT_SECONDS = _env_int(
+    "BROWSER_REGISTER_TIMEOUT_SECONDS",
+    600,
+    minimum=60,
+)
+_DEFAULT_CONTEXT_CLOSE_TIMEOUT_SECONDS = _env_int(
+    "BROWSER_CONTEXT_CLOSE_TIMEOUT_SECONDS",
+    15,
+    minimum=1,
+)
+_DEFAULT_BROWSER_RECYCLE_TIMEOUT_SECONDS = _env_int(
+    "BROWSER_RECYCLE_TIMEOUT_SECONDS",
+    45,
+    minimum=5,
+)
 
 _locks: dict[str, threading.Lock] = {}
 _pools: dict[str, "BrowserProcessPool"] = {}
@@ -73,6 +89,19 @@ _pools: dict[str, "BrowserProcessPool"] = {}
 
 def _pool_key(headless: bool) -> str:
     return "headless" if headless else "headed"
+
+
+class BrowserRegistrationTimeoutError(RuntimeError):
+    """The shared browser stopped responding before one registration settled."""
+
+
+@dataclass(slots=True)
+class _BrowserSlot:
+    manager: Any
+    browser: Any
+    semaphore: asyncio.Semaphore
+    recycle_lock: asyncio.Lock
+    generation: int = 0
 
 
 class BrowserProcessPool:
@@ -87,6 +116,9 @@ class BrowserProcessPool:
         context_start_interval_ms: int = _DEFAULT_CONTEXT_START_INTERVAL_MS,
         startup_concurrency: int = _DEFAULT_STARTUP_CONCURRENCY,
         block_images: bool = _DEFAULT_BLOCK_IMAGES,
+        registration_timeout_seconds: float = _DEFAULT_REGISTER_TIMEOUT_SECONDS,
+        context_close_timeout_seconds: float = _DEFAULT_CONTEXT_CLOSE_TIMEOUT_SECONDS,
+        browser_recycle_timeout_seconds: float = _DEFAULT_BROWSER_RECYCLE_TIMEOUT_SECONDS,
     ):
         self.headless = headless
         self.pool_size = max(int(pool_size or 1), 1)
@@ -98,6 +130,9 @@ class BrowserProcessPool:
             self.capacity,
         )
         self.block_images = bool(block_images and self.headless)
+        self.registration_timeout = max(float(registration_timeout_seconds or 0), 0.1)
+        self.context_close_timeout = max(float(context_close_timeout_seconds or 0), 0.1)
+        self.browser_recycle_timeout = max(float(browser_recycle_timeout_seconds or 0), 0.1)
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -105,7 +140,7 @@ class BrowserProcessPool:
         # Keep the AsyncCamoufox manager alive alongside the Browser.  The
         # manager owns the Playwright driver process; retaining only Browser
         # makes browser.close() insufficient and leaks the driver/zombies.
-        self._browsers: list[tuple[Any, Any, asyncio.Semaphore]] = []
+        self._browsers: list[_BrowserSlot] = []
         self._global_sem: asyncio.Semaphore | None = None
         self._startup_sem: asyncio.Semaphore | None = None
         self._context_start_lock: asyncio.Lock | None = None
@@ -180,29 +215,96 @@ class BrowserProcessPool:
         self._startup_sem = asyncio.Semaphore(self.startup_concurrency)
         self._context_start_lock = asyncio.Lock()
         for _ in range(self.pool_size):
-            manager = AsyncCamoufox(
-                headless=self.headless,
-                # Registration pages do not need visual assets.  Camoufox's
-                # native blocker avoids downloading/decoding them without a
-                # Python route callback on every request.
-                block_images=self.block_images,
-                enable_cache=False,
-            )
-            browser = await manager.__aenter__()
+            manager, browser = await self._launch_browser()
             self._browsers.append(
-                (manager, browser, asyncio.Semaphore(self.max_contexts))
+                _BrowserSlot(
+                    manager=manager,
+                    browser=browser,
+                    semaphore=asyncio.Semaphore(self.max_contexts),
+                    recycle_lock=asyncio.Lock(),
+                )
             )
+
+    async def _launch_browser(self):
+        manager = AsyncCamoufox(
+            headless=self.headless,
+            # Registration pages do not need visual assets.  Camoufox's
+            # native blocker avoids downloading/decoding them without a
+            # Python route callback on every request.
+            block_images=self.block_images,
+            enable_cache=False,
+        )
+        browser = await manager.__aenter__()
+        return manager, browser
+
+    async def _close_browser(self, manager, browser) -> None:
+        if manager is None and browser is None:
+            return
+        try:
+            if manager is not None:
+                exit_task = asyncio.create_task(manager.__aexit__(None, None, None))
+                done, _ = await asyncio.wait(
+                    {exit_task},
+                    timeout=self.browser_recycle_timeout,
+                )
+                if done:
+                    exit_task.result()
+                    return
+                exit_task.cancel()
+        except Exception:
+            pass
+        try:
+            if browser is not None:
+                close_task = asyncio.create_task(browser.close())
+                done, _ = await asyncio.wait(
+                    {close_task},
+                    timeout=self.context_close_timeout,
+                )
+                if done:
+                    close_task.result()
+                else:
+                    close_task.cancel()
+        except Exception:
+            pass
+
+    async def _recycle_browser_slot(
+        self,
+        slot: _BrowserSlot,
+        *,
+        expected_generation: int,
+        log_fn: Callable[..., None],
+    ) -> None:
+        async with slot.recycle_lock:
+            if slot.generation != expected_generation:
+                return
+            old_manager, old_browser = slot.manager, slot.browser
+            slot.manager = None
+            slot.browser = None
+            slot.generation += 1
+            await self._close_browser(old_manager, old_browser)
+            if self._closed:
+                return
+            try:
+                manager, browser = await asyncio.wait_for(
+                    self._launch_browser(),
+                    timeout=self.browser_recycle_timeout,
+                )
+            except Exception as exc:
+                log_fn(f"共享浏览器进程重建失败: {exc}", level="error")
+                return
+            slot.manager = manager
+            slot.browser = browser
+            log_fn("卡死的共享浏览器进程已重建", level="warning")
 
     async def _async_shutdown(self) -> None:
         browsers, self._browsers = self._browsers, []
-        for manager, browser, _ in reversed(browsers):
-            try:
-                await manager.__aexit__(None, None, None)
-            except Exception:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
+        for slot in reversed(browsers):
+            async with slot.recycle_lock:
+                manager, browser = slot.manager, slot.browser
+                slot.manager = None
+                slot.browser = None
+                slot.generation += 1
+                await self._close_browser(manager, browser)
         self._browsers.clear()
 
     # ------------------------------------------------------------- register
@@ -248,7 +350,25 @@ class BrowserProcessPool:
             ),
             self._loop,
         )
-        return future.result()
+        sync_timeout = (
+            self.registration_timeout
+            + self.context_close_timeout
+            + self.browser_recycle_timeout
+            + 30
+        )
+        try:
+            return future.result(timeout=sync_timeout)
+        except FutureTimeoutError as exc:
+            # ``concurrent.futures.TimeoutError`` is an alias of the built-in
+            # TimeoutError.  A completed registration may legitimately raise
+            # the latter for OTP polling; only treat it as an event-loop stall
+            # when the future itself is still pending.
+            if future.done():
+                raise
+            future.cancel()
+            raise BrowserRegistrationTimeoutError(
+                f"共享浏览器事件循环超过 {int(sync_timeout)} 秒未响应"
+            ) from exc
 
     async def _register_coro(
         self,
@@ -261,12 +381,73 @@ class BrowserProcessPool:
         otp_callback,
         log_fn,
     ) -> dict:
+        state: dict[str, Any] = {}
+        task = asyncio.create_task(
+            self._register_with_retries(
+                email=email,
+                password=password,
+                proxy=proxy,
+                proxy_rotate_callback=proxy_rotate_callback,
+                max_proxy_attempts=max_proxy_attempts,
+                otp_callback=otp_callback,
+                log_fn=log_fn,
+                state=state,
+            )
+        )
+        done, _ = await asyncio.wait({task}, timeout=self.registration_timeout)
+        if done:
+            return task.result()
+
+        task.cancel()
+        await asyncio.wait(
+            {task},
+            timeout=self.context_close_timeout + 5,
+        )
+
+        slot = state.get("slot")
+        generation = state.get("generation")
+        log_fn(
+            f"浏览器注册超过 {int(self.registration_timeout)} 秒，"
+            "正在取消 worker 并重建卡死浏览器",
+            level="error",
+        )
+        if isinstance(slot, _BrowserSlot) and isinstance(generation, int):
+            await self._recycle_browser_slot(
+                slot,
+                expected_generation=generation,
+                log_fn=log_fn,
+            )
+        raise BrowserRegistrationTimeoutError(
+            f"浏览器注册超过 {int(self.registration_timeout)} 秒，worker 已终止"
+        )
+
+    async def _register_with_retries(
+        self,
+        *,
+        email,
+        password,
+        proxy,
+        proxy_rotate_callback,
+        max_proxy_attempts,
+        otp_callback,
+        log_fn,
+        state: dict[str, Any],
+    ) -> dict:
         async with self._global_sem:
             # 轮询找一个有剩余 context 配额的浏览器
             while True:
-                for _, browser, sem in self._browsers:
-                    if not sem.locked():
-                        async with sem:
+                if self._browsers and not any(
+                    slot.browser is not None for slot in self._browsers
+                ):
+                    raise RuntimeError("共享浏览器池无可用进程，需要重启任务后重建")
+                for slot in self._browsers:
+                    if slot.browser is not None and not slot.semaphore.locked():
+                        async with slot.semaphore:
+                            browser = slot.browser
+                            if browser is None:
+                                continue
+                            state["slot"] = slot
+                            state["generation"] = slot.generation
                             attempts = max(int(max_proxy_attempts or 1), 1)
                             current_proxy = proxy
                             for attempt in range(1, attempts + 1):
@@ -280,6 +461,7 @@ class BrowserProcessPool:
                                         otp_callback=otp_callback,
                                         log=log_fn,
                                         startup_gate=self._startup_sem,
+                                        close_timeout_seconds=self.context_close_timeout,
                                     )
                                 except BrowserProxyBlockedError as exc:
                                     if not callable(proxy_rotate_callback):
@@ -362,4 +544,9 @@ def shutdown_shared_pool(headless: bool | None = None) -> None:
                 pool.shutdown()
 
 
-__all__ = ["BrowserProcessPool", "get_shared_pool", "shutdown_shared_pool"]
+__all__ = [
+    "BrowserProcessPool",
+    "BrowserRegistrationTimeoutError",
+    "get_shared_pool",
+    "shutdown_shared_pool",
+]

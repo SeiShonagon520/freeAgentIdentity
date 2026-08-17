@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 from application import tasks as tasks_module
 from application.registration_pulse import PulseConfig, PulseRegistration
 from application.tasks import (
+    MAX_REGISTER_CONCURRENCY,
     TASK_STATUS_CANCELLED,
     TASK_STATUS_FAILED,
     TASK_STATUS_SUCCEEDED,
@@ -311,6 +313,107 @@ def test_pulse_success_counts_accounts_and_sets_result():
     assert sorted(c["index"] for c in registrar.wave_calls()) == [0, 1, 2, 3]
 
 
+def test_pulse_honors_requested_wave_concurrency():
+    allocator = _FakeAllocator(
+        nodes=("Node A", "Node B", "Node C", "Node D", "Node E"),
+        slot_count=5,
+    )
+    state = {"active": 0, "maximum": 0}
+    lock = threading.Lock()
+
+    def wave_fn(index, node):
+        with lock:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+        try:
+            time.sleep(0.02)
+            return {"account_id": 100 + index, "email": f"a{index}@example.com"}
+        finally:
+            with lock:
+                state["active"] -= 1
+
+    registrar = _FakeRegistrar(wave_fn=wave_fn)
+    logger, _ = _run_pulse(
+        registrar,
+        allocator,
+        count=5,
+        wave_concurrency=2,
+    )
+
+    assert logger.finished == (TASK_STATUS_SUCCEEDED, "")
+    assert state["maximum"] == 2
+
+
+def test_pulse_updates_progress_before_the_whole_wave_finishes():
+    allocator = _FakeAllocator(nodes=("Node A", "Node B"), slot_count=2)
+    logger = _FakeLogger()
+    slow_release = threading.Event()
+    fast_finished = threading.Event()
+
+    def wave_fn(index, node):
+        if index == 1:
+            slow_release.wait(timeout=2)
+        else:
+            fast_finished.set()
+        return {"account_id": 100 + index, "email": f"a{index}@example.com"}
+
+    registrar = _FakeRegistrar(wave_fn=wave_fn)
+    controller = PulseRegistration(
+        do_one=registrar,
+        allocator=allocator,
+        config=PulseConfig(wave_concurrency=2),
+        logger=logger,
+        count=2,
+    )
+    thread = threading.Thread(target=controller.run)
+    thread.start()
+    try:
+        assert fast_finished.wait(timeout=1)
+        deadline = time.monotonic() + 1
+        saw_partial_progress = False
+        while time.monotonic() < deadline:
+            with logger._lock:
+                saw_partial_progress = ("progress", 1, 2) in logger.events
+            if saw_partial_progress:
+                break
+            time.sleep(0.01)
+        assert saw_partial_progress
+    finally:
+        slow_release.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert logger.finished == (TASK_STATUS_SUCCEEDED, "")
+
+
+def test_pulse_wave_timeout_fails_instead_of_waiting_forever():
+    allocator = _FakeAllocator(nodes=("Node A",), slot_count=1)
+    logger = _FakeLogger()
+    release = threading.Event()
+    registrar = _FakeRegistrar(
+        wave_fn=lambda index, node: (
+            release.wait(timeout=2)
+            or {"account_id": 100 + index, "email": f"a{index}@example.com"}
+        )
+    )
+    controller = PulseRegistration(
+        do_one=registrar,
+        allocator=allocator,
+        config=PulseConfig(wave_timeout_seconds=0.05),
+        logger=logger,
+        count=1,
+    )
+    thread = threading.Thread(target=controller.run)
+    thread.start()
+    thread.join(timeout=1)
+    try:
+        assert not thread.is_alive()
+        assert logger.finished[0] == TASK_STATUS_FAILED
+        assert "注册波次超过" in logger.finished[1]
+    finally:
+        release.set()
+
+
 def test_pulse_no_email_requeues_bans_and_probe_recovers():
     allocator = _FakeAllocator(nodes=("Node A",))
     attempts = {"count": 0}
@@ -371,6 +474,18 @@ def test_pulse_regular_failure_does_not_ban_node():
 
     # wrong OTP / already-exists are account-level failures, not IP bans.
     assert allocator.banned_nodes() == []
+
+
+def test_pulse_stops_when_the_shared_browser_event_loop_is_unresponsive():
+    allocator = _FakeAllocator(nodes=("Node A",))
+    registrar = _FakeRegistrar(
+        wave_fn=lambda index, node: "共享浏览器事件循环超过 690 秒未响应"
+    )
+    logger, _ = _run_pulse(registrar, allocator, count=0)
+
+    assert logger.finished[0] == TASK_STATUS_FAILED
+    assert "共享浏览器池失去响应" in logger.finished[1]
+    assert len(registrar.wave_calls()) == 1
     assert allocator.banned_calls == []
     assert logger.result_data["fail"] == 1
     assert logger.result_data["success"] == 0
@@ -552,17 +667,23 @@ def test_pulse_config_from_payload_and_clamping():
     assert cfg.probe_interval_seconds == 600
     assert cfg.probe_otp_timeout_seconds == 90
     assert cfg.ban_after_consecutive_no_email == 3
+    assert cfg.wave_concurrency == MAX_REGISTER_CONCURRENCY
+    assert cfg.wave_timeout_seconds == 900
 
     cfg2 = PulseConfig.from_payload(
         {
             "probe_interval_seconds": 60,
             "probe_otp_timeout_seconds": 45,
             "ban_after_consecutive_no_email": 3,
+            "concurrency": 24,
+            "pulse_wave_timeout_seconds": 1200,
         }
     )
     assert cfg2.probe_interval_seconds == 60
     assert cfg2.probe_otp_timeout_seconds == 45
     assert cfg2.ban_after_consecutive_no_email == 3
+    assert cfg2.wave_concurrency == 24
+    assert cfg2.wave_timeout_seconds == 1200
 
 
 # -------------------------------------------------------------- task wiring
