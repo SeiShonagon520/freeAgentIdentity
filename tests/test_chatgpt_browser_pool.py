@@ -360,7 +360,9 @@ def test_async_flow_never_polls_otp_twice_after_submission(monkeypatch):
     # The post-submit page may remain on the OTP URL while navigation is
     # queued behind other contexts.  It must neither poll twice nor fail on
     # the old four-poll stuck threshold.
-    stages = iter(["password", "password", "otp", *("otp" for _ in range(6)), "complete"])
+    stages = iter(
+        ["password", "password", "password", "otp", *("otp" for _ in range(6)), "complete"]
+    )
     otp_calls = []
 
     class Page:
@@ -413,9 +415,124 @@ def test_async_flow_never_polls_otp_twice_after_submission(monkeypatch):
     assert otp_calls == [True]
 
 
+def test_async_flow_forces_password_setup_before_polling_signup_otp(monkeypatch):
+    # The current OpenAI signup defaults to passwordless OTP.  Registration
+    # must choose the password fallback before consuming the mailbox code.
+    stages = iter(["otp", "otp", "otp", "password", "otp", "complete"])
+    otp_calls = []
+    clicks = []
+    fills = []
+
+    class Page:
+        url = "https://auth.openai.com/email-verification"
+
+    async def no_sleep(_seconds):
+        return None
+
+    async def fake_stage(_page):
+        return next(stages)
+
+    async def fake_selector(_page, selectors, **_kwargs):
+        if selectors == browser_register_async.EMAIL_INPUT_SELECTORS:
+            return "input[type=email]"
+        if selectors == browser_register_async.PASSWORD_INPUT_SELECTORS:
+            return "input[type=password]"
+        return "input[autocomplete=one-time-code]"
+
+    async def fake_fill(_page, selector, value):
+        fills.append((selector, value))
+        return True
+
+    async def fake_click(_page, selectors, **_kwargs):
+        clicks.append(selectors)
+        return selectors[0]
+
+    async def fake_goto(*_args, **_kwargs):
+        return None
+
+    async def fake_session(*_args, **_kwargs):
+        return {"accessToken": "token"}
+
+    async def fake_result(*_args, **_kwargs):
+        return {"access_token": "token"}
+
+    monkeypatch.setattr(browser_register_async.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(browser_register_async, "_derive_stage_from_page", fake_stage)
+    monkeypatch.setattr(browser_register_async, "_wait_for_any_selector", fake_selector)
+    monkeypatch.setattr(browser_register_async, "_fill_input_like_user", fake_fill)
+    monkeypatch.setattr(browser_register_async, "_click_first", fake_click)
+    monkeypatch.setattr(browser_register_async, "_goto_with_retry", fake_goto)
+    monkeypatch.setattr(browser_register_async, "_fetch_session_via_page", fake_session)
+    monkeypatch.setattr(browser_register_async, "_build_session_result", fake_result)
+
+    result = asyncio.run(
+        browser_register_async._browser_registration_flow(
+            Page(),
+            "user@example.com",
+            "StrongPass123!",
+            lambda: otp_calls.append(True) or "123456",
+            lambda *_args, **_kwargs: None,
+        )
+    )
+
+    assert result == {"access_token": "token"}
+    assert otp_calls == [True]
+    assert browser_register_async.PASSWORD_REGISTRATION_FALLBACK_SELECTORS in clicks
+    assert ("input[type=password]", "StrongPass123!") in fills
+
+
+def test_async_flow_rejects_completed_passwordless_account(monkeypatch):
+    stages = iter(["complete", "complete", "complete"])
+
+    class Page:
+        url = "https://chatgpt.com/"
+
+    async def no_sleep(_seconds):
+        return None
+
+    async def fake_stage(_page):
+        return next(stages)
+
+    async def fake_selector(_page, _selectors, **_kwargs):
+        return "input[type=email]"
+
+    async def fake_fill(*_args, **_kwargs):
+        return True
+
+    async def fake_click(*_args, **_kwargs):
+        return "button"
+
+    async def fake_goto(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(browser_register_async.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(browser_register_async, "_derive_stage_from_page", fake_stage)
+    monkeypatch.setattr(browser_register_async, "_wait_for_any_selector", fake_selector)
+    monkeypatch.setattr(browser_register_async, "_fill_input_like_user", fake_fill)
+    monkeypatch.setattr(browser_register_async, "_click_first", fake_click)
+    monkeypatch.setattr(browser_register_async, "_goto_with_retry", fake_goto)
+
+    with pytest.raises(RuntimeError, match="未完成密码设置"):
+        asyncio.run(
+            browser_register_async._browser_registration_flow(
+                Page(),
+                "user@example.com",
+                "StrongPass123!",
+                lambda: "123456",
+                lambda *_args, **_kwargs: None,
+            )
+        )
+
+
 def test_async_flow_allows_slow_email_verification_transition(monkeypatch):
     stages = iter(
-        ["password", "password", *("email_verification" for _ in range(6)), "complete"]
+        [
+            "password",
+            "password",
+            "password",
+            *("email_verification" for _ in range(6)),
+            "complete",
+        ]
     )
 
     class Page:

@@ -35,6 +35,7 @@ from .browser_register import (
     NAME_INPUT_SELECTORS,
     OTP_INPUT_SELECTORS,
     PASSWORD_INPUT_SELECTORS,
+    PASSWORD_REGISTRATION_FALLBACK_SELECTORS,
     PASSWORD_SUBMIT_SELECTORS,
     _SESSION_COOKIE_NAME,
     _build_proxy_config,
@@ -621,6 +622,9 @@ async def _browser_registration_flow(
             entry_submitted = await open_registration_entry()
 
     seen: dict[str, int] = {}
+    password_submitted = False
+    password_fallback_requested_at: float | None = None
+    password_fallback_attempts = 0
     otp_submitted = False
     otp_submitted_at: float | None = None
     otp_submit_retried = False
@@ -663,10 +667,17 @@ async def _browser_registration_flow(
             continue
 
         if stage == "complete":
+            if not password_submitted:
+                raise RuntimeError(
+                    "注册会话已建立，但 OpenAI 端未完成密码设置；拒绝保存无密码账号"
+                )
             log("注册完成：会话已建立")
             return await _build_session_result(page, await _fetch_session_via_page(page, log), log)
 
         if stage == "password":
+            if password_submitted:
+                await asyncio.sleep(2)
+                continue
             selector = await _wait_for_any_selector(page, PASSWORD_INPUT_SELECTORS, timeout=15)
             if not selector:
                 continue
@@ -675,10 +686,34 @@ async def _browser_registration_flow(
             if not await _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=6):
                 await _submit_visible_form(page, selector)
                 log("密码页已用 Enter 提交")
+            password_submitted = True
             await asyncio.sleep(2)
             continue
 
         if stage == "otp":
+            if not password_submitted:
+                if password_fallback_requested_at is not None:
+                    if time.monotonic() - password_fallback_requested_at >= 30:
+                        raise RuntimeError("已选择密码注册，但 30 秒内未进入密码设置页")
+                    await asyncio.sleep(2)
+                    continue
+                password_fallback_attempts += 1
+                clicked = await _click_first(
+                    page,
+                    PASSWORD_REGISTRATION_FALLBACK_SELECTORS,
+                    timeout=8,
+                )
+                if clicked:
+                    password_fallback_requested_at = time.monotonic()
+                    log(f"已从无密码 OTP 注册切换到密码注册: {clicked}")
+                    await asyncio.sleep(2)
+                    continue
+                if password_fallback_attempts < 3:
+                    await asyncio.sleep(2)
+                    continue
+                raise RuntimeError(
+                    "注册进入邮箱验证码页，但未找到密码设置入口；拒绝创建无密码账号"
+                )
             # Navigation can complete between stage detection and logging.
             # Once a code was submitted, never poll/fill it again; wait for
             # the next URL instead of reusing a stale OTP on about-you.

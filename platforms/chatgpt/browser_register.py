@@ -74,6 +74,14 @@ PASSWORD_SUBMIT_SELECTORS = [
     'button:has-text("注册")',
 ]
 
+# OpenAI now defaults new email signups to a passwordless OTP flow.  The
+# password stored by this project is not registered remotely unless the user
+# explicitly chooses this fallback on the OTP page first.
+PASSWORD_REGISTRATION_FALLBACK_SELECTORS = [
+    'a[href="/create-account/password"]',
+    'a[href*="/create-account/password"]',
+]
+
 OTP_INPUT_SELECTORS = [
     "input[autocomplete='one-time-code']",
     "input[inputmode='numeric']",
@@ -620,6 +628,9 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback: Ca
     # 2) 等待 auth.openai.com 注册链，推进状态机
     time.sleep(1.5)
     seen: dict[str, int] = {}
+    password_submitted = False
+    password_fallback_requested_at: float | None = None
+    password_fallback_attempts = 0
     otp_submitted = False
     about_you_submitted = False
     for step in range(20):
@@ -633,10 +644,17 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback: Ca
             raise RuntimeError(f"注册状态卡住: stage={stage} url={current_url}")
 
         if stage == "complete":
+            if not password_submitted:
+                raise RuntimeError(
+                    "注册会话已建立，但 OpenAI 端未完成密码设置；拒绝保存无密码账号"
+                )
             log("注册完成：会话已建立")
             return _build_session_result(page, _fetch_session_via_page(page, log), log)
 
         if stage == "password":
+            if password_submitted:
+                time.sleep(2)
+                continue
             selector = _wait_for_any_selector(page, PASSWORD_INPUT_SELECTORS, timeout=15)
             if not selector:
                 continue
@@ -646,10 +664,34 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback: Ca
             if not clicked:
                 _submit_visible_form(page, selector)
                 log("密码页已用 Enter 提交")
+            password_submitted = True
             time.sleep(2)
             continue
 
         if stage == "otp":
+            if not password_submitted:
+                if password_fallback_requested_at is not None:
+                    if time.monotonic() - password_fallback_requested_at >= 30:
+                        raise RuntimeError("已选择密码注册，但 30 秒内未进入密码设置页")
+                    time.sleep(2)
+                    continue
+                password_fallback_attempts += 1
+                clicked = _click_first(
+                    page,
+                    PASSWORD_REGISTRATION_FALLBACK_SELECTORS,
+                    timeout=8,
+                )
+                if clicked:
+                    password_fallback_requested_at = time.monotonic()
+                    log(f"已从无密码 OTP 注册切换到密码注册: {clicked}")
+                    time.sleep(2)
+                    continue
+                if password_fallback_attempts < 3:
+                    time.sleep(2)
+                    continue
+                raise RuntimeError(
+                    "注册进入邮箱验证码页，但未找到密码设置入口；拒绝创建无密码账号"
+                )
             # 已提交过验证码就等待页面推进，不重复取码/填码（避免打断提交）
             if otp_submitted:
                 time.sleep(2)
