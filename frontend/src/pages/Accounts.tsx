@@ -96,7 +96,6 @@ function RegisterDialog({ onClose, onCreated }: { onClose: () => void, onCreated
   const [probeBatch, setProbeBatch] = useState('5')
   const [harCapture, setHarCapture] = useState(false)
   const [harCapture2fa, setHarCapture2fa] = useState(false)
-  const [bindTotp2fa, setBindTotp2fa] = useState(true)
   const [executorType, setExecutorType] = useState<'protocol' | 'headed' | 'headless'>('protocol')
 
   const loadProxyNodes = useCallback(async (refresh = false) => {
@@ -189,7 +188,7 @@ function RegisterDialog({ onClose, onCreated }: { onClose: () => void, onCreated
           split_register: splitRegister,
           extra: {
             mail_provider: mailProvider,
-            bind_totp_2fa: bindTotp2fa && !harCapture,
+            bind_totp_2fa: true,
           },
         }),
       })
@@ -256,10 +255,9 @@ function RegisterDialog({ onClose, onCreated }: { onClose: () => void, onCreated
               </div>
             )}
           </label>
-          <label className="flex items-center gap-2 text-sm text-[var(--text-secondary)] sm:col-span-2">
-            <input type="checkbox" checked={bindTotp2fa} onChange={event => setBindTotp2fa(event.target.checked)} disabled={harCapture} className="accent-sky-500" />
-            注册成功后自动绑定 TOTP 2FA（两步验证）
-          </label>
+          <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-400 sm:col-span-2">
+            自动注册固定要求远端密码，并在成功后绑定和激活 TOTP 2FA；任一步失败都不会保存账号。
+          </div>
           {harAvailable && <div className="grid gap-2 rounded-md border border-[var(--border)] bg-[var(--bg-pane)]/40 p-3 sm:col-span-2">
             <label className="flex items-center gap-2 text-sm text-[var(--text-secondary)]">
               <input type="checkbox" checked={harCapture} onChange={event => setHarCapture(event.target.checked)} className="accent-sky-500" />

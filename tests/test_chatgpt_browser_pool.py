@@ -487,7 +487,7 @@ def test_async_flow_never_polls_otp_twice_after_submission(monkeypatch):
         )
     )
 
-    assert result == {"access_token": "token"}
+    assert result == {"access_token": "token", "password_registered": True}
     assert otp_calls == [True]
 
 
@@ -551,7 +551,7 @@ def test_async_flow_forces_password_setup_before_polling_signup_otp(monkeypatch)
         )
     )
 
-    assert result == {"access_token": "token"}
+    assert result == {"access_token": "token", "password_registered": True}
     assert otp_calls == [True]
     assert browser_register_async.PASSWORD_REGISTRATION_FALLBACK_SELECTORS in clicks
     assert ("input[type=password]", "StrongPass123!") in fills
@@ -610,7 +610,7 @@ def test_async_flow_allows_slow_password_submit_transition(monkeypatch):
         )
     )
 
-    assert result == {"access_token": "token"}
+    assert result == {"access_token": "token", "password_registered": True}
     assert [item for item in fills if item[0] == "input[type=password]"] == [
         ("input[type=password]", "StrongPass123!")
     ]
@@ -716,7 +716,7 @@ def test_async_flow_allows_slow_email_verification_transition(monkeypatch):
         )
     )
 
-    assert result == {"access_token": "token"}
+    assert result == {"access_token": "token", "password_registered": True}
 
 
 def test_about_you_required_consent_is_checked_idempotently():

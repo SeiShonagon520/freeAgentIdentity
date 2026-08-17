@@ -297,11 +297,10 @@ def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
     if executor_type not in ("protocol", "headless", "headed"):
         executor_type = "protocol"
     extra = dict(payload.get("extra") or {})
-    # Automated headless registrations are expected to be immediately usable
-    # when copied/exported. Keep an explicit false as an opt-out, but make the
-    # default bind TOTP for API clients that omit the flag.
-    if executor_type == "headless" and "bind_totp_2fa" not in extra:
-        extra["bind_totp_2fa"] = True
+    # Every automated ChatGPT registration must leave a remotely configured
+    # password and an activated TOTP factor. There is no opt-out: otherwise an
+    # API client could still create passwordless or incomplete accounts.
+    extra["bind_totp_2fa"] = True
     payload = {
         **payload,
         "platform": "chatgpt",
@@ -1101,6 +1100,10 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     use_proxy_pool = bool(payload.get("proxy_pool"))
     proxy_api_url = str(payload.get("proxy_api_url") or "").strip() or None
     extra = dict(payload.get("extra") or {})
+    # Re-assert the invariant at execution time as well, so queued/legacy API
+    # payloads cannot bypass mandatory TOTP activation.
+    extra["bind_totp_2fa"] = True
+    payload = {**payload, "extra": extra}
     task_id = str(getattr(logger, "task_id", "") or "")
 
     # Manual camoufox HAR-capture mode: open a real browser, the operator
@@ -1379,6 +1382,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 )
             account_extra = dict(getattr(account, "extra", {}) or {})
             account.extra = account_extra
+            password_confirmed = bool(
+                account_extra.pop("_registration_password_confirmed", False)
+            )
+            if not password_confirmed:
+                raise RuntimeError(
+                    "注册结果未确认 OpenAI 端密码已设置，账号未保存"
+                )
             registration_proxy = str(
                 account_extra.pop("_registration_proxy", "") or ""
             ).strip()

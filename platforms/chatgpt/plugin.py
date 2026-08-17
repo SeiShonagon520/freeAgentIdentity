@@ -151,6 +151,9 @@ class ChatGPTPlatform(BasePlatform):
         if not isinstance(totp_result, dict):
             totp_result = {}
         extra = {
+            "_registration_password_confirmed": bool(
+                result.get("password_registered")
+            ),
             "account_id": result.get("account_id", ""),
             "access_token": result.get("access_token", ""),
             "refresh_token": result.get("refresh_token", ""),

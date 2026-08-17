@@ -707,6 +707,7 @@ def _browser_registration_flow(
                 )
             log("注册完成：会话已建立")
             result = _build_session_result(page, _fetch_session_via_page(page, log), log)
+            result["password_registered"] = True
             if bind_totp_2fa:
                 log("正在复用注册浏览器会话绑定 TOTP 2FA...")
                 try:

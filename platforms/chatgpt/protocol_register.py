@@ -1372,6 +1372,7 @@ class ChatGPTProtocolRegister:
                     allow_redirects=True,
                 )
             result = self._session_result(email, password)
+            result["password_registered"] = True
             self.log("ChatGPT Web 兼容注册完成")
             return result
         finally:
@@ -1418,6 +1419,25 @@ class ChatGPTProtocolRegister:
                 continue
 
             if _email_otp_step(page_type, continue_url):
+                if not password_registered:
+                    # OpenAI can default a new signup to the passwordless OTP
+                    # branch. Require the remote password API to accept our
+                    # password before consuming an email verification code.
+                    self._visit_auth_step(
+                        "/create-account/password",
+                        referer=continue_url or "/create-account",
+                    )
+                    password_result = self._register_password(email, password)
+                    self._direct_registration_mutated = True
+                    password_registered = True
+                    page_type = _authorization_page_type(password_result)
+                    continue_url = _authorization_continue_url(password_result)
+                    otp_already_dispatched = _email_otp_step(page_type, continue_url)
+                    self.log(
+                        "已从无密码 OTP 注册切换到密码注册: "
+                        f"next={page_type or continue_url or 'unknown'}"
+                    )
+                    continue
                 if otp_completed:
                     raise RuntimeError("邮箱验证码校验后仍停留在 OTP 页面")
                 self._visit_auth_step(
@@ -1467,7 +1487,7 @@ class ChatGPTProtocolRegister:
         if not otp_completed:
             raise RuntimeError("OpenAI 注册流程未完成邮箱验证码校验")
         if not password_registered:
-            self.log("当前 OpenAI 注册状态未要求单独设置密码")
+            raise RuntimeError("OpenAI 注册流程未确认远端密码设置，拒绝创建无密码账号")
 
         if continue_url:
             self._visit_auth_step(continue_url, referer="/email-verification")
@@ -1515,7 +1535,9 @@ class ChatGPTProtocolRegister:
             email=email,
             continue_url=_authorization_continue_url(created),
         )
-        return self._codex_registration_result(email, password, tokens)
+        result = self._codex_registration_result(email, password, tokens)
+        result["password_registered"] = True
+        return result
 
 
     def run(self, *, email: str, password: str) -> dict:

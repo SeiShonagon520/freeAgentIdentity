@@ -26,7 +26,7 @@ def test_headless_registration_defaults_to_binding_totp(monkeypatch):
     assert captured["payload"]["extra"]["bind_totp_2fa"] is True
 
 
-def test_headless_registration_preserves_explicit_totp_opt_out(monkeypatch):
+def test_all_registration_modes_override_explicit_totp_opt_out(monkeypatch):
     captured = {}
     monkeypatch.setattr(
         tasks_module,
@@ -37,7 +37,7 @@ def test_headless_registration_preserves_explicit_totp_opt_out(monkeypatch):
     tasks_module.create_register_task(
         {
             "count": 1,
-            "executor_type": "headless",
+            "executor_type": "protocol",
             "extra": {
                 "mail_provider": "local_ms_pool",
                 "bind_totp_2fa": False,
@@ -45,7 +45,26 @@ def test_headless_registration_preserves_explicit_totp_opt_out(monkeypatch):
         }
     )
 
-    assert captured["payload"]["extra"]["bind_totp_2fa"] is False
+    assert captured["payload"]["extra"]["bind_totp_2fa"] is True
+
+
+def test_headed_registration_always_requires_totp(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        tasks_module,
+        "create_task",
+        lambda **kwargs: captured.update(kwargs) or {"task_id": "headed-task"},
+    )
+
+    tasks_module.create_register_task(
+        {
+            "count": 1,
+            "executor_type": "headed",
+            "extra": {"mail_provider": "local_ms_pool", "bind_totp_2fa": False},
+        }
+    )
+
+    assert captured["payload"]["extra"]["bind_totp_2fa"] is True
 
 
 def test_bind_registered_account_totp_uses_proxy_persists_and_closes(monkeypatch):
@@ -175,6 +194,7 @@ def test_chatgpt_result_maps_browser_totp_secret_to_platform_credentials():
     )
 
     assert result.extra["totp_secret"] == "BROWSERBOUNDSECRET"
+    assert result.extra["_registration_password_confirmed"] is False
     credentials = _platform_credentials_from_extra(result.extra)
     assert any(
         item["key"] == "totp_secret"
@@ -182,3 +202,17 @@ def test_chatgpt_result_maps_browser_totp_secret_to_platform_credentials():
         and item["credential_type"] == "secret"
         for item in credentials
     )
+
+
+def test_chatgpt_result_maps_password_confirmation_marker():
+    platform = object.__new__(ChatGPTPlatform)
+    result = platform._map_chatgpt_result(
+        {
+            "email": "user@example.com",
+            "access_token": "access-token",
+            "password_registered": True,
+        },
+        password="StrongPass123!",
+    )
+
+    assert result.extra["_registration_password_confirmed"] is True

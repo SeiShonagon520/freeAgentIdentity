@@ -90,6 +90,8 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
                 extra={
                     "access_token": "access-token",
                     "cookies": {"oai-did": "device-123", "session": "saved-cookie"},
+                    "_registration_password_confirmed": True,
+                    "totp_secret": "TESTTOTPSECRET",
                 },
             )
 
@@ -149,6 +151,11 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
             {
                 "account_id": 123,
                 "email": "registered@example.com",
+                "totp_2fa": {
+                    "requested": True,
+                    "bound": True,
+                    "error": "",
+                },
             }
         ],
         "auto_upload_sub2api_agent_identity": True,
@@ -184,7 +191,11 @@ def test_register_task_retries_once_with_a_new_mailbox_after_otp_timeout(monkeyp
                 email="retry-success@example.com",
                 password=password or "Secret123!",
                 user_id="acct_retry",
-                extra={"access_token": "retry-access"},
+                extra={
+                    "access_token": "retry-access",
+                    "_registration_password_confirmed": True,
+                    "totp_secret": "TESTTOTPSECRET",
+                },
             )
 
     monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
@@ -327,6 +338,57 @@ def test_register_task_does_not_save_an_account_whose_access_token_returns_401(m
     assert any("401 验活失败" in str(event) for event in logger.events)
 
 
+def test_register_task_does_not_save_without_remote_password_confirmation(monkeypatch):
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email=email or "passwordless@example.com",
+                password=password or "Secret123!",
+                extra={"access_token": "fresh-access-token"},
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.credential_checks.check_chatgpt_access_token",
+        lambda *_args, **_kwargs: {"state": "valid", "message": "access token 可用"},
+    )
+    monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        tasks_module,
+        "save_account",
+        lambda account: (_ for _ in ()).throw(
+            AssertionError("must not save a password-unconfirmed account")
+        ),
+    )
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "count": 1,
+            "concurrency": 1,
+            "email": "passwordless@example.com",
+            "extra": {"identity_provider": "mailbox", "bind_totp_2fa": False},
+        },
+        logger,
+    )
+
+    assert logger.finished[0] == tasks_module.TASK_STATUS_FAILED
+    assert logger.result_data["success"] == 0
+    assert logger.result_data["fail"] == 1
+    assert any("密码已设置" in str(event) for event in logger.events)
+
+
 def test_register_task_saves_an_account_when_401_check_is_inconclusive(monkeypatch):
     class FakePlatform:
         def register(self, email=None, password=None):
@@ -334,7 +396,11 @@ def test_register_task_saves_an_account_when_401_check_is_inconclusive(monkeypat
                 platform="chatgpt",
                 email=email or "unconfirmed@example.com",
                 password=password or "Secret123!",
-                extra={"access_token": "fresh-access-token"},
+                extra={
+                    "access_token": "fresh-access-token",
+                    "_registration_password_confirmed": True,
+                    "totp_secret": "TESTTOTPSECRET",
+                },
             )
 
     monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
@@ -468,7 +534,11 @@ def test_register_task_uploads_each_saved_account_immediately(monkeypatch):
                 email=email or "registered@example.com",
                 password=password or "Secret123!",
                 user_id="acct_123",
-                extra={"access_token": "access-token"},
+                extra={
+                    "access_token": "access-token",
+                    "_registration_password_confirmed": True,
+                    "totp_secret": "TESTTOTPSECRET",
+                },
             )
 
     saved_ids = iter((123, 124))

@@ -203,6 +203,7 @@ def test_protocol_register_completes_email_flow_without_browser(monkeypatch):
     assert result["session_token"] == "session-token"
     assert result["account_id"] == "account-123"
     assert result["workspace_id"] == "account-123"
+    assert result["password_registered"] is True
     assert session.password_body == {
         "username": "user@outlook.com",
         "password": "StrongPass123!",
@@ -255,15 +256,18 @@ def test_protocol_register_accepts_otp_first_authorization_state(monkeypatch):
                 self.calls.append(("POST", url, kwargs))
                 return _FakeResponse(
                     payload={
-                        "continue_url": "/create-account/password",
-                        "page": {"type": "create_account_password"},
+                        "continue_url": "/about-you",
+                        "page": {"type": "about_you"},
                     }
                 )
             if url == OPENAI_API_ENDPOINTS["register"]:
                 self.calls.append(("POST", url, kwargs))
                 self.password_body = kwargs["json"]
                 return _FakeResponse(
-                    payload={"continue_url": "/about-you", "page": {"type": "about_you"}}
+                    payload={
+                        "continue_url": "/email-verification",
+                        "page": {"type": "email_otp_verification"},
+                    }
                 )
             return super().post(url, **kwargs)
 
@@ -284,7 +288,45 @@ def test_protocol_register_accepts_otp_first_authorization_state(monkeypatch):
         index for index, (method, url, _kwargs) in enumerate(session.calls)
         if method == "POST" and url == OPENAI_API_ENDPOINTS["register"]
     )
-    assert validate_index < register_index
+    assert register_index < validate_index
+    assert result["password_registered"] is True
+
+
+def test_protocol_register_rejects_otp_first_flow_when_password_creation_fails(monkeypatch):
+    _install_valid_web_session_mint(monkeypatch)
+
+    class PasswordRejectedSession(_FakeSession):
+        def post(self, url, **kwargs):
+            if url == OPENAI_API_ENDPOINTS["signup"]:
+                self.calls.append(("POST", url, kwargs))
+                self.current_email = str(kwargs["json"]["username"]["value"])
+                return _FakeResponse(
+                    payload={
+                        "continue_url": "/email-verification",
+                        "page": {"type": "email_otp_verification"},
+                    }
+                )
+            if url == OPENAI_API_ENDPOINTS["register"]:
+                self.calls.append(("POST", url, kwargs))
+                return _FakeResponse(
+                    status_code=400,
+                    payload={"error": {"message": "password rejected"}},
+                )
+            return super().post(url, **kwargs)
+
+    session = PasswordRejectedSession()
+    worker = ChatGPTProtocolRegister(
+        session=session,
+        otp_callback=lambda: "123456",
+    )
+
+    with pytest.raises(RuntimeError, match="设置 ChatGPT 密码失败"):
+        worker.run(email="password-required@example.com", password="StrongPass123!")
+
+    assert not any(
+        method == "POST" and url == OPENAI_API_ENDPOINTS["validate_otp"]
+        for method, url, _kwargs in session.calls
+    )
 
 
 def test_protocol_register_lets_create_account_decide_after_add_phone_hint():
@@ -315,6 +357,7 @@ def test_protocol_register_lets_create_account_decide_after_add_phone_hint():
 
     assert result["access_token"] == "codex-access"
     assert result["refresh_token"] == "codex-refresh"
+    assert result["password_registered"] is True
     assert any(
         method == "POST" and url == OPENAI_API_ENDPOINTS["create_account"]
         for method, url, _kwargs in session.calls
