@@ -35,8 +35,10 @@ class _FakeAsyncBrowser:
 def test_browser_pool_closes_the_async_camoufox_manager(monkeypatch):
     _FakeAsyncManager.instances.clear()
     monkeypatch.setattr(browser_pool, "AsyncCamoufox", _FakeAsyncManager)
+    startup_gates = []
 
     async def fake_register(_browser, **kwargs):
+        startup_gates.append(kwargs["startup_gate"])
         return {"email": kwargs["email"]}
 
     monkeypatch.setattr(browser_pool, "register_in_context", fake_register)
@@ -60,6 +62,8 @@ def test_browser_pool_closes_the_async_camoufox_manager(monkeypatch):
     assert all(manager.entered == 1 for manager in _FakeAsyncManager.instances)
     assert all(manager.exited == 1 for manager in _FakeAsyncManager.instances)
     assert pool.capacity == 2
+    assert pool.startup_concurrency == 2
+    assert startup_gates == [pool._startup_sem]
     assert all(
         manager.kwargs == {
             "headless": True,
@@ -213,6 +217,35 @@ def test_login_vpn_block_is_classified_for_proxy_rotation():
         assert "VPN" in str(exc) or "vpn" in str(exc).lower()
     else:
         raise AssertionError("VPN rejection must trigger proxy rotation")
+
+
+def test_navigation_timeout_keeps_an_already_usable_login_form(monkeypatch):
+    logs = []
+
+    class Page:
+        async def goto(self, *_args, **_kwargs):
+            raise TimeoutError("DOMContentLoaded timeout")
+
+    async def no_hard_block(_page):
+        return ""
+
+    async def visible_email(_page, selectors, **_kwargs):
+        assert selectors == browser_register_async.EMAIL_INPUT_SELECTORS
+        return "input[name=email]"
+
+    monkeypatch.setattr(browser_register_async, "_hard_proxy_block_reason", no_hard_block)
+    monkeypatch.setattr(browser_register_async, "_wait_for_any_selector", visible_email)
+
+    result = asyncio.run(
+        _goto_with_retry(
+            Page(),
+            "https://chatgpt.com/auth/login",
+            log=lambda message, **_kwargs: logs.append(message),
+        )
+    )
+
+    assert result is None
+    assert any("登录表单已可用" in message for message in logs)
 
 
 def test_async_flow_never_polls_otp_twice_after_submission(monkeypatch):

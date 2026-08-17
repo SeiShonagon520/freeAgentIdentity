@@ -7,7 +7,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -78,6 +78,7 @@ class MihomoProxyLease:
     slot: int
     node: str
     proxy: str
+    attempted_nodes: set[str] = field(default_factory=set)
     released: bool = False
 
     def rotate(self) -> str:
@@ -235,6 +236,7 @@ class MihomoRegistrationAllocator:
             slot=slot,
             node=node,
             proxy=self.client.slot_proxy_url(slot),
+            attempted_nodes={node},
         )
         self._active[slot] = lease
         self._node_counts[node] = self._node_counts.get(node, 0) + 1
@@ -257,7 +259,12 @@ class MihomoRegistrationAllocator:
             # otherwise a burst of transient failures can exhaust every node.
             self._blocked_until[old_node] = time.monotonic() + self._cooldown_seconds
             self._node_counts[old_node] = max(self._node_counts.get(old_node, 0) - 1, 0)
-            excluded = {old_node}
+            # Never send the same registration worker back through a node it
+            # already timed out on.  Other workers may reuse that node after
+            # cooldown, but one worker must make forward progress through the
+            # pool instead of bouncing between the same few cooling exits.
+            lease.attempted_nodes.add(old_node)
+            excluded = set(lease.attempted_nodes)
             last_error: MihomoNodeError | None = None
             while True:
                 try:
@@ -269,6 +276,7 @@ class MihomoRegistrationAllocator:
                         ) from last_error
                     raise exc
                 self._node_counts[next_node] = self._node_counts.get(next_node, 0) + 1
+                lease.attempted_nodes.add(next_node)
                 try:
                     self.client.activate_slot_node(lease.slot, next_node)
                     return next_node

@@ -288,6 +288,40 @@ def test_mihomo_registration_allocator_keeps_worker_slots_sticky(monkeypatch):
     second.release()
 
 
+def test_registration_worker_never_revisits_a_timed_out_node(monkeypatch):
+    client = MihomoClient(
+        controller_url="http://mihomo.test:9090",
+        proxy_url="http://mihomo.test:7890",
+        group="REGISTER-ALL",
+    )
+    client.slot_count = 1
+    monkeypatch.setattr(
+        client,
+        "list_nodes",
+        lambda **_kwargs: {
+            "nodes": [
+                {"name": "Node A", "alive": True},
+                {"name": "Node B", "alive": True},
+                {"name": "Node C", "alive": True},
+            ]
+        },
+    )
+    monkeypatch.setattr(client, "is_node_enabled", lambda _node: True)
+    monkeypatch.setattr(client, "activate_slot_node", lambda *_args, **_kwargs: "")
+
+    allocator = client.create_registration_allocator()
+    lease = allocator.acquire()
+    visited = [lease.node]
+    visited.append(lease.rotate() and lease.node)
+    visited.append(lease.rotate() and lease.node)
+
+    assert visited == ["Node A", "Node B", "Node C"]
+    assert lease.attempted_nodes == set(visited)
+    with pytest.raises(MihomoNodeError):
+        lease.rotate()
+    lease.release()
+
+
 def test_registration_preflight_excludes_chatgpt_vpn_blocked_nodes(monkeypatch):
     client = MihomoClient(
         controller_url="http://mihomo.test:9090",

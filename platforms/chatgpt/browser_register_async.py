@@ -168,6 +168,25 @@ async def _goto_with_retry(page, url: str, *, log, timeout: int = 45000, attempt
             retryable = _is_transient_nav_error(exc) or "timeout" in str(exc).lower()
             if not retryable:
                 raise
+            # Playwright's DOMContentLoaded timeout does not necessarily mean
+            # the page is unusable.  Under CPU saturation the login form can
+            # already be interactive while a late script keeps the lifecycle
+            # event pending.  Preserve that usable page instead of throwing
+            # away the context and rotating a healthy proxy.
+            hard_block = await _hard_proxy_block_reason(page)
+            if hard_block:
+                raise BrowserProxyBlockedError(hard_block) from exc
+            email_selector = await _wait_for_any_selector(
+                page,
+                EMAIL_INPUT_SELECTORS,
+                timeout=2,
+            )
+            if email_selector:
+                log(
+                    f"导航等待超时但登录表单已可用: {email_selector}",
+                    level="warning",
+                )
+                return None
             log(f"页面导航瞬时断连({attempt + 1}/{attempts}): {exc}，重试...", level="warning")
             await asyncio.sleep(2)
     raise BrowserProxyBlockedError(
@@ -540,16 +559,32 @@ async def _build_session_result(page, session_data: dict, log) -> dict:
     return result
 
 
-async def _browser_registration_flow(page, email: str, password: str, otp_callback: Callable[[], str],
-                                     log) -> dict:
+async def _browser_registration_flow(
+    page,
+    email: str,
+    password: str,
+    otp_callback: Callable[[], str],
+    log,
+    startup_gate: asyncio.Semaphore | None = None,
+) -> dict:
     log(f"开始 ChatGPT 浏览器注册: {email}")
 
-    await _goto_with_retry(page, f"{CHATGPT_APP}/auth/login", log=log)
-    await asyncio.sleep(1.5)
+    async def open_registration_entry() -> bool:
+        await _goto_with_retry(page, f"{CHATGPT_APP}/auth/login", log=log)
+        await asyncio.sleep(1.5)
 
-    entry_submitted = False
-    email_selector = await _wait_for_any_selector(page, EMAIL_INPUT_SELECTORS, timeout=12)
-    if email_selector:
+        email_selector = await _wait_for_any_selector(page, EMAIL_INPUT_SELECTORS, timeout=12)
+        if not email_selector:
+            hard_block = await _hard_proxy_block_reason(page)
+            snapshot = await _page_snapshot(page)
+            raise BrowserProxyBlockedError(
+                hard_block
+                or (
+                    "登录页未找到邮箱输入框，当前代理返回了不可用页面；"
+                    f"title={snapshot['title']!r} body={snapshot['body'][:240]!r}"
+                )
+            )
+
         await _fill_input_like_user(page, email_selector, email)
         log(f"登录页已填邮箱: {email_selector}")
         submit = await _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=5)
@@ -558,48 +593,52 @@ async def _browser_registration_flow(page, email: str, password: str, otp_callba
             log("登录页已用 Enter 提交邮箱")
         else:
             log(f"登录页已点击: {submit}")
-        entry_submitted = True
-    else:
-        hard_block = await _hard_proxy_block_reason(page)
-        snapshot = await _page_snapshot(page)
-        raise BrowserProxyBlockedError(
-            hard_block
-            or (
-                "登录页未找到邮箱输入框，当前代理返回了不可用页面；"
-                f"title={snapshot['title']!r} body={snapshot['body'][:240]!r}"
-            )
-        )
 
-    # 提交邮箱后等待跳转到 auth.openai.com（signin 请求走代理可能慢，最多 45s）
-    entry_deadline = time.time() + 45
-    while time.time() < entry_deadline:
-        if await _derive_stage_from_page(page) != "entry":
-            break
-        await asyncio.sleep(2)
-    if await _derive_stage_from_page(page) == "entry":
-        hard_block = await _hard_proxy_block_reason(page)
-        snapshot = await _page_snapshot(page)
-        raise BrowserProxyBlockedError(
-            hard_block
-            or (
-                "邮箱提交后入口 45 秒未跳转；"
-                f"title={snapshot['title']!r} body={snapshot['body'][:240]!r}"
+        # Keep the CPU-heavy entry/auth transition inside the startup gate.
+        # Once the password/OTP stage appears the worker mostly waits on
+        # network and mailbox I/O, so it no longer needs scarce startup slots.
+        entry_deadline = time.time() + 45
+        while time.time() < entry_deadline:
+            if await _derive_stage_from_page(page) != "entry":
+                break
+            await asyncio.sleep(2)
+        if await _derive_stage_from_page(page) == "entry":
+            hard_block = await _hard_proxy_block_reason(page)
+            snapshot = await _page_snapshot(page)
+            raise BrowserProxyBlockedError(
+                hard_block
+                or (
+                    "邮箱提交后入口 45 秒未跳转；"
+                    f"title={snapshot['title']!r} body={snapshot['body'][:240]!r}"
+                )
             )
-        )
+        return True
+
+    if startup_gate is None:
+        entry_submitted = await open_registration_entry()
+    else:
+        async with startup_gate:
+            entry_submitted = await open_registration_entry()
+
     seen: dict[str, int] = {}
     otp_submitted = False
+    otp_submitted_at: float | None = None
+    otp_submit_retried = False
+    otp_input_selector: str | None = None
     about_you_submitted = False
-    for step in range(20):
+    email_verification_started_at: float | None = None
+    email_verification_retried = False
+    for step in range(40):
         stage = await _derive_stage_from_page(page)
         current_url = str(page.url or "")[:120]
         seen[stage] = seen.get(stage, 0) + 1
         log(f"注册推进 step={step + 1} stage={stage} url={current_url} seen={seen[stage]}")
-        # OTP submission and the following email-verification transition can
-        # legitimately remain on the same URL for 10-20 seconds when 8 cores
-        # are saturated.  Treating the fifth poll as a hard failure caused
-        # false negatives at 24/30 concurrency.
-        stuck_limit = 10 if stage in {"otp", "email_verification"} else 4
-        if seen[stage] > stuck_limit and stage != "cloudflare":
+        # OTP and email verification use explicit elapsed-time deadlines below.
+        # Count-based limits are too sensitive to scheduler speed at 30-way load.
+        if (
+            stage not in {"otp", "email_verification", "cloudflare"}
+            and seen[stage] > 4
+        ):
             if stage in {"entry", "blocked", "unknown"}:
                 snapshot = await _page_snapshot(page)
                 raise BrowserProxyBlockedError(
@@ -644,6 +683,22 @@ async def _browser_registration_flow(page, email: str, password: str, otp_callba
             # Once a code was submitted, never poll/fill it again; wait for
             # the next URL instead of reusing a stale OTP on about-you.
             if otp_submitted:
+                submitted_at = (
+                    otp_submitted_at
+                    if otp_submitted_at is not None
+                    else time.monotonic()
+                )
+                elapsed = time.monotonic() - submitted_at
+                if elapsed >= 60:
+                    raise RuntimeError(
+                        f"验证码提交后 60 秒未跳转: url={current_url}"
+                    )
+                if elapsed >= 12 and not otp_submit_retried:
+                    clicked = await _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=3)
+                    if not clicked and otp_input_selector:
+                        await _submit_visible_form(page, otp_input_selector)
+                    otp_submit_retried = True
+                    log("验证码页未跳转，已使用同一验证码重试提交", level="warning")
                 await asyncio.sleep(2)
                 continue
             if not otp_callback:
@@ -656,12 +711,14 @@ async def _browser_registration_flow(page, email: str, password: str, otp_callba
             selector = await _wait_for_any_selector(page, OTP_INPUT_SELECTORS, timeout=15)
             if not selector:
                 continue
+            otp_input_selector = selector
             await _fill_input_like_user(page, selector, code)
             log("已填验证码")
             if not await _click_first(page, PASSWORD_SUBMIT_SELECTORS, timeout=6):
                 await _submit_visible_form(page, selector)
                 log("验证码页已用 Enter 提交")
             otp_submitted = True
+            otp_submitted_at = time.monotonic()
             await asyncio.sleep(3)
             continue
 
@@ -712,9 +769,21 @@ async def _browser_registration_flow(page, email: str, password: str, otp_callba
             continue
 
         if stage == "email_verification":
-            if await _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=3):
-                log("邮箱验证页已点击继续")
-            await asyncio.sleep(1.5)
+            now = time.monotonic()
+            if email_verification_started_at is None:
+                email_verification_started_at = now
+                if await _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=3):
+                    log("邮箱验证页已点击继续")
+            elapsed = now - email_verification_started_at
+            if elapsed >= 60:
+                raise RuntimeError(
+                    f"邮箱验证页 60 秒未跳转: url={current_url}"
+                )
+            if elapsed >= 12 and not email_verification_retried:
+                if await _click_first(page, EMAIL_SUBMIT_SELECTORS, timeout=3):
+                    log("邮箱验证页未跳转，已重试点击继续", level="warning")
+                email_verification_retried = True
+            await asyncio.sleep(2)
             continue
 
         if stage == "entry":
@@ -754,7 +823,8 @@ async def _browser_registration_flow(page, email: str, password: str, otp_callba
 
 
 async def register_in_context(browser, *, email: str, password: str, proxy: str | None,
-                              otp_callback: Callable[[], str], log) -> dict:
+                              otp_callback: Callable[[], str], log,
+                              startup_gate: asyncio.Semaphore | None = None) -> dict:
     """在共享浏览器进程里开一个独立指纹 context，跑完注册并关闭 context。"""
     context = await AsyncNewContext(
         browser,
@@ -771,7 +841,14 @@ async def register_in_context(browser, *, email: str, password: str, proxy: str 
     try:
         page = await context.new_page()
         try:
-            final = await _browser_registration_flow(page, email, password, otp_callback, log)
+            final = await _browser_registration_flow(
+                page,
+                email,
+                password,
+                otp_callback,
+                log,
+                startup_gate=startup_gate,
+            )
             result = dict(final)
             result.update({"email": email, "password": password, "platform": "chatgpt"})
             return result

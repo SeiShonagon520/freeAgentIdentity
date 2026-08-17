@@ -60,6 +60,11 @@ _DEFAULT_CONTEXT_START_INTERVAL_MS = _env_int(
     "BROWSER_CONTEXT_START_INTERVAL_MS",
     175,
 )
+_DEFAULT_STARTUP_CONCURRENCY = _env_int(
+    "BROWSER_POOL_STARTUP_CONCURRENCY",
+    16,
+    minimum=1,
+)
 _DEFAULT_BLOCK_IMAGES = _env_bool("CHATGPT_BROWSER_BLOCK_IMAGES", True)
 
 _locks: dict[str, threading.Lock] = {}
@@ -80,6 +85,7 @@ class BrowserProcessPool:
         pool_size: int,
         max_contexts_per_browser: int,
         context_start_interval_ms: int = _DEFAULT_CONTEXT_START_INTERVAL_MS,
+        startup_concurrency: int = _DEFAULT_STARTUP_CONCURRENCY,
         block_images: bool = _DEFAULT_BLOCK_IMAGES,
     ):
         self.headless = headless
@@ -87,6 +93,10 @@ class BrowserProcessPool:
         self.max_contexts = max(int(max_contexts_per_browser or 1), 1)
         self.capacity = self.pool_size * self.max_contexts
         self.context_start_interval = max(int(context_start_interval_ms or 0), 0) / 1000
+        self.startup_concurrency = min(
+            max(int(startup_concurrency or 1), 1),
+            self.capacity,
+        )
         self.block_images = bool(block_images and self.headless)
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -97,6 +107,7 @@ class BrowserProcessPool:
         # makes browser.close() insufficient and leaks the driver/zombies.
         self._browsers: list[tuple[Any, Any, asyncio.Semaphore]] = []
         self._global_sem: asyncio.Semaphore | None = None
+        self._startup_sem: asyncio.Semaphore | None = None
         self._context_start_lock: asyncio.Lock | None = None
         self._next_context_start = 0.0
         self._init_error: BaseException | None = None
@@ -162,6 +173,11 @@ class BrowserProcessPool:
 
     async def _async_init(self) -> None:
         self._global_sem = asyncio.Semaphore(self.capacity)
+        # Initial navigation and login-form hydration are the CPU-heavy part
+        # of registration.  Limit only that phase so 30 workers do not all
+        # drive Firefox to 800% at once; OTP/network waits remain fully
+        # concurrent after the entry form is submitted.
+        self._startup_sem = asyncio.Semaphore(self.startup_concurrency)
         self._context_start_lock = asyncio.Lock()
         for _ in range(self.pool_size):
             manager = AsyncCamoufox(
@@ -263,6 +279,7 @@ class BrowserProcessPool:
                                         proxy=current_proxy,
                                         otp_callback=otp_callback,
                                         log=log_fn,
+                                        startup_gate=self._startup_sem,
                                     )
                                 except BrowserProxyBlockedError as exc:
                                     if not callable(proxy_rotate_callback):
