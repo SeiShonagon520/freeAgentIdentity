@@ -868,7 +868,7 @@ def _persist_totp_secret(account_id: int, secret: str) -> None:
 
 def _bind_registered_account_totp(
     account: Any,
-    account_id: int,
+    account_id: int | None = None,
     *,
     proxy: str | None = None,
 ) -> str:
@@ -881,10 +881,15 @@ def _bind_registered_account_totp(
     if not access_token:
         raise RuntimeError("注册结果缺少 access token，无法绑定 TOTP 2FA")
 
-    mfa_session = _cffi_requests.Session(
-        impersonate=PROTOCOL_CHROME_IMPERSONATE,
-        timeout=30,
-    )
+    account_extra = dict(getattr(account, "extra", {}) or {})
+    session_kwargs: dict[str, Any] = {
+        "impersonate": PROTOCOL_CHROME_IMPERSONATE,
+        "timeout": 30,
+    }
+    cookies = str(account_extra.get("cookies") or "").strip()
+    if cookies:
+        session_kwargs["headers"] = {"Cookie": cookies}
+    mfa_session = _cffi_requests.Session(**session_kwargs)
     try:
         if proxy:
             mfa_session.proxies = {"http": proxy, "https": proxy}
@@ -901,7 +906,8 @@ def _bind_registered_account_totp(
     secret = str(result.get("secret") or "").strip()
     if not secret:
         raise RuntimeError("TOTP 已激活但接口未返回 secret")
-    _persist_totp_secret(account_id, secret)
+    if int(account_id or 0) > 0:
+        _persist_totp_secret(int(account_id), secret)
     return secret
 
 
@@ -1371,6 +1377,49 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     f"{access_token_message or '未知响应'}",
                     level="warning",
                 )
+            account_extra = dict(getattr(account, "extra", {}) or {})
+            account.extra = account_extra
+            registration_proxy = str(
+                account_extra.pop("_registration_proxy", "") or ""
+            ).strip()
+            browser_totp_error = str(
+                account_extra.pop("_registration_totp_error", "") or ""
+            ).strip()
+            totp_result: dict[str, Any] = {
+                "requested": bool(extra.get("bind_totp_2fa")),
+                "bound": False,
+                "error": "",
+            }
+            if totp_result["requested"]:
+                totp_secret = str(account_extra.get("totp_secret") or "").strip()
+                if totp_secret:
+                    totp_result["bound"] = True
+                    logger.log(
+                        f"{account.email} 已在注册浏览器会话内完成 TOTP 2FA 绑定"
+                    )
+                else:
+                    if browser_totp_error:
+                        logger.log(
+                            "浏览器会话内 TOTP 绑定未完成，正在使用同一登录态协议重试："
+                            f"{browser_totp_error}",
+                            level="warning",
+                        )
+                    else:
+                        logger.log(f"正在为 {account.email} 绑定 TOTP 2FA...")
+                    try:
+                        totp_secret = _bind_registered_account_totp(
+                            account,
+                            proxy=registration_proxy or worker_proxy,
+                        )
+                    except Exception as mfa_exc:
+                        totp_result["error"] = str(mfa_exc)[:200]
+                        raise RuntimeError(
+                            f"{account.email} TOTP 2FA 绑定失败，账号未保存："
+                            f"{totp_result['error']}"
+                        ) from mfa_exc
+                    account_extra["totp_secret"] = totp_secret
+                    totp_result["bound"] = True
+                    logger.log(f"{account.email} TOTP 2FA 绑定成功，secret 将随账号保存")
             with account_save_lock:
                 if logger.is_cancel_requested():
                     return "__cancel_requested__"
@@ -1381,29 +1430,6 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             saved_account_id = int(saved_account.id)
             if resolved_proxy and registration_allocator is None:
                 proxy_pool.report_success(resolved_proxy)
-            totp_result: dict[str, Any] = {
-                "requested": bool(extra.get("bind_totp_2fa")),
-                "bound": False,
-                "error": "",
-            }
-            if totp_result["requested"]:
-                logger.log(f"正在为 {account.email} 绑定 TOTP 2FA...")
-                try:
-                    _bind_registered_account_totp(
-                        account,
-                        saved_account_id,
-                        proxy=worker_proxy,
-                    )
-                except Exception as mfa_exc:
-                    totp_result["error"] = str(mfa_exc)[:200]
-                    logger.log(
-                        f"{account.email} TOTP 2FA 绑定失败（账号已保存）："
-                        f"{totp_result['error']}",
-                        level="error",
-                    )
-                else:
-                    totp_result["bound"] = True
-                    logger.log(f"{account.email} TOTP 2FA 绑定成功，secret 已保存")
             if sub2api_upload_config:
                 logger.log(f"正在上传 {account.email} 的 Agent Identity 到 Sub2API")
                 try:

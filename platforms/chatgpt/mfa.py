@@ -32,9 +32,15 @@ from typing import Any, Optional
 
 from .constants import CHATGPT_APP
 
-_MFA_INFO_URL = f"{CHATGPT_APP}/backend-api/accounts/mfa_info"
-_MFA_ENROLL_URL = f"{CHATGPT_APP}/backend-api/accounts/mfa/enroll"
-_MFA_ACTIVATE_URL = f"{CHATGPT_APP}/backend-api/accounts/mfa/user/activate_enrollment"
+MFA_INFO_URL = f"{CHATGPT_APP}/backend-api/accounts/mfa_info"
+MFA_ENROLL_URL = f"{CHATGPT_APP}/backend-api/accounts/mfa/enroll"
+MFA_ACTIVATE_URL = f"{CHATGPT_APP}/backend-api/accounts/mfa/user/activate_enrollment"
+
+# Backwards-compatible private aliases for callers/tests that imported the old
+# module constants directly.
+_MFA_INFO_URL = MFA_INFO_URL
+_MFA_ENROLL_URL = MFA_ENROLL_URL
+_MFA_ACTIVATE_URL = MFA_ACTIVATE_URL
 
 
 def totp_code(secret_b32: str, *, step: int = 30, digits: int = 6) -> str:
@@ -112,6 +118,37 @@ def activate_totp_enrollment(
     )
 
 
+def prepare_totp_activation(
+    enrollment: dict[str, Any],
+    *,
+    code_provider=None,
+) -> tuple[str, str, dict[str, str]]:
+    """Validate an enrollment response and build the activation request.
+
+    Browser registration uses the same payload builder while sending the HTTP
+    requests through ``page.evaluate(fetch)`` so the MFA calls retain the exact
+    browser cookies, TLS fingerprint, and proxy route that created the account.
+    """
+    secret = str(enrollment.get("secret") or "").strip()
+    session_id = str(enrollment.get("session_id") or "").strip()
+    if not secret or not session_id:
+        raise RuntimeError(
+            "TOTP 绑定失败：enroll 未返回 secret/session_id: "
+            f"{json.dumps(enrollment)[:200]}"
+        )
+    if code_provider is None:
+        code = totp_code(secret)
+    else:
+        code = str(code_provider(secret)).strip()
+    if not code:
+        raise RuntimeError("TOTP 绑定失败：无法生成验证码")
+    return secret, session_id, {
+        "code": code,
+        "factor_type": "totp",
+        "session_id": session_id,
+    }
+
+
 def bind_totp_2fa(
     session,
     access_token: str,
@@ -125,17 +162,16 @@ def bind_totp_2fa(
     TOTP locally).
     """
     enroll = enroll_totp(session, access_token)
-    secret = str(enroll.get("secret") or "").strip()
-    session_id = str(enroll.get("session_id") or "").strip()
-    if not secret or not session_id:
-        raise RuntimeError(f"TOTP 绑定失败：enroll 未返回 secret/session_id: {json.dumps(enroll)[:200]}")
-    if code_provider is None:
-        code = totp_code(secret)
-    else:
-        code = str(code_provider(secret)).strip()
-    if not code:
-        raise RuntimeError("TOTP 绑定失败：无法生成验证码")
-    result = activate_totp_enrollment(session, access_token, code, session_id)
+    secret, session_id, activation_body = prepare_totp_activation(
+        enroll,
+        code_provider=code_provider,
+    )
+    result = activate_totp_enrollment(
+        session,
+        access_token,
+        activation_body["code"],
+        session_id,
+    )
     return {
         "secret": secret,
         "session_id": session_id,
@@ -145,9 +181,13 @@ def bind_totp_2fa(
 
 
 __all__ = [
+    "MFA_INFO_URL",
+    "MFA_ENROLL_URL",
+    "MFA_ACTIVATE_URL",
     "totp_code",
     "get_mfa_status",
     "enroll_totp",
     "activate_totp_enrollment",
+    "prepare_totp_activation",
     "bind_totp_2fa",
 ]

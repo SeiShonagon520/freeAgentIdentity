@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import pytest
@@ -218,6 +219,81 @@ def test_async_registration_context_uses_lightweight_headless_options(monkeypatc
     assert captured["reduced_motion"] == "reduce"
     assert captured["service_workers"] == "block"
     assert captured["closed"] is True
+
+
+def test_async_registration_context_forwards_totp_binding_and_proxy(monkeypatch):
+    captured = {}
+
+    class Context:
+        async def new_page(self):
+            return object()
+
+        async def close(self):
+            return None
+
+    async def fake_new_context(_browser, **_kwargs):
+        return Context()
+
+    async def fake_flow(*_args, **kwargs):
+        captured.update(kwargs)
+        return {"access_token": "token"}
+
+    monkeypatch.setattr(browser_register_async, "AsyncNewContext", fake_new_context)
+    monkeypatch.setattr(browser_register_async, "_browser_registration_flow", fake_flow)
+
+    result = asyncio.run(
+        browser_register_async.register_in_context(
+            object(),
+            email="user@example.com",
+            password="password",
+            proxy="http://slot-2:7902",
+            otp_callback=lambda: "123456",
+            bind_totp_2fa=True,
+            log=lambda *_args, **_kwargs: None,
+        )
+    )
+
+    assert captured["bind_totp_2fa"] is True
+    assert result["_registration_proxy"] == "http://slot-2:7902"
+
+
+def test_async_browser_totp_binding_uses_authenticated_page_fetch(monkeypatch):
+    calls = []
+
+    async def fake_fetch(_page, url, **kwargs):
+        calls.append((url, kwargs))
+        if url == browser_register_async.MFA_ENROLL_URL:
+            return {
+                "ok": True,
+                "status": 200,
+                "text": json.dumps(
+                    {
+                        "secret": "JBSWY3DPEHPK3PXP",
+                        "session_id": "enrollment-session",
+                    }
+                ),
+            }
+        return {"ok": True, "status": 200, "text": '{"success":true}'}
+
+    monkeypatch.setattr(browser_register_async, "_browser_fetch", fake_fetch)
+
+    secret = asyncio.run(
+        browser_register_async._bind_totp_via_page(object(), "access-token")
+    )
+
+    assert secret == "JBSWY3DPEHPK3PXP"
+    assert [url for url, _kwargs in calls] == [
+        browser_register_async.MFA_ENROLL_URL,
+        browser_register_async.MFA_ACTIVATE_URL,
+    ]
+    assert all(
+        kwargs["headers"]["authorization"] == "Bearer access-token"
+        for _url, kwargs in calls
+    )
+    activation_body = json.loads(calls[1][1]["body"])
+    assert activation_body["factor_type"] == "totp"
+    assert activation_body["session_id"] == "enrollment-session"
+    assert len(activation_body["code"]) == 6
 
 
 def test_async_registration_context_close_has_a_hard_timeout(monkeypatch):

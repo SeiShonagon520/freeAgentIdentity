@@ -3,6 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from application import tasks as tasks_module
+from core.account_graph import _platform_credentials_from_extra
+from platforms.chatgpt.plugin import ChatGPTPlatform
 
 
 def test_headless_registration_defaults_to_binding_totp(monkeypatch):
@@ -113,3 +115,70 @@ def test_bind_registered_account_totp_does_not_persist_unconfirmed_secret(monkey
 
     assert persisted == []
     assert session.closed is True
+
+
+def test_bind_registered_account_totp_reuses_exported_browser_cookies_before_save(monkeypatch):
+    captured = {}
+    session = SimpleNamespace(proxies={}, closed=False)
+    session.close = lambda: setattr(session, "closed", True)
+
+    def make_session(**kwargs):
+        captured.update(kwargs)
+        return session
+
+    monkeypatch.setattr("curl_cffi.requests.Session", make_session)
+    monkeypatch.setattr(
+        "platforms.chatgpt.mfa.bind_totp_2fa",
+        lambda *_args, **_kwargs: {
+            "activated": True,
+            "secret": "COOKIESESSIONSECRET",
+            "result": {"success": True},
+        },
+    )
+    persisted = []
+    monkeypatch.setattr(
+        tasks_module,
+        "_persist_totp_secret",
+        lambda *_args: persisted.append(True),
+    )
+
+    secret = tasks_module._bind_registered_account_totp(
+        SimpleNamespace(
+            token="access-token",
+            extra={"cookies": "oai-did=device; __Secure-next-auth.session-token=session"},
+        ),
+        proxy="http://127.0.0.1:19001",
+    )
+
+    assert secret == "COOKIESESSIONSECRET"
+    assert captured["headers"] == {
+        "Cookie": "oai-did=device; __Secure-next-auth.session-token=session"
+    }
+    assert persisted == []
+    assert session.closed is True
+
+
+def test_chatgpt_result_maps_browser_totp_secret_to_platform_credentials():
+    platform = object.__new__(ChatGPTPlatform)
+    result = platform._map_chatgpt_result(
+        {
+            "email": "user@example.com",
+            "access_token": "access-token",
+            "totp_2fa": {
+                "requested": True,
+                "bound": True,
+                "secret": "BROWSERBOUNDSECRET",
+                "error": "",
+            },
+        },
+        password="StrongPass123!",
+    )
+
+    assert result.extra["totp_secret"] == "BROWSERBOUNDSECRET"
+    credentials = _platform_credentials_from_extra(result.extra)
+    assert any(
+        item["key"] == "totp_secret"
+        and item["value"] == "BROWSERBOUNDSECRET"
+        and item["credential_type"] == "secret"
+        for item in credentials
+    )

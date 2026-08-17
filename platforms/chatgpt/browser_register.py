@@ -28,6 +28,7 @@ from urllib.parse import urlencode, urlparse
 from camoufox.sync_api import Camoufox
 
 from .constants import CHATGPT_APP, OPENAI_AUTH
+from .mfa import MFA_ACTIVATE_URL, MFA_ENROLL_URL, prepare_totp_activation
 
 # ---------------------------------------------------------------------------
 # 页面元素选择器（同一批选择器在有头/无头下通用）
@@ -546,6 +547,52 @@ def _browser_fetch(page, url: str, *, method: str = "GET", headers: dict | None 
     return payload if isinstance(payload, dict) else {"ok": False, "status": 0, "url": "", "text": ""}
 
 
+def _browser_mfa_json(page, url: str, access_token: str, *, body: dict[str, Any]) -> dict[str, Any]:
+    response = _browser_fetch(
+        page,
+        url,
+        method="POST",
+        headers={
+            "accept": "application/json",
+            "authorization": f"Bearer {access_token}",
+            "content-type": "application/json",
+        },
+        body=json.dumps(body, separators=(",", ":")),
+        redirect="follow",
+    )
+    status = int(response.get("status") or 0)
+    text = str(response.get("text") or "")
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"浏览器内 TOTP API 返回 HTTP {status}: {text[:160]}")
+    try:
+        payload = json.loads(text)
+    except Exception as exc:
+        raise RuntimeError(f"浏览器内 TOTP API 返回非 JSON: {text[:160]}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("浏览器内 TOTP API 返回格式无效")
+    return payload
+
+
+def _bind_totp_via_page(page, access_token: str) -> str:
+    """Bind TOTP inside the just-created browser session."""
+    enrollment = _browser_mfa_json(
+        page,
+        MFA_ENROLL_URL,
+        access_token,
+        body={"factor_type": "totp"},
+    )
+    secret, _session_id, activation_body = prepare_totp_activation(enrollment)
+    activation = _browser_mfa_json(
+        page,
+        MFA_ACTIVATE_URL,
+        access_token,
+        body=activation_body,
+    )
+    if not activation.get("success"):
+        raise RuntimeError(f"浏览器内 TOTP 激活未确认: {str(activation)[:160]}")
+    return secret
+
+
 def _start_browser_signin_via_fetch(page, email: str, device_id: str, log) -> str:
     """浏览器内 POST /api/auth/signin/openai 直入授权链（与前端行为一致）。"""
     try:
@@ -595,8 +642,15 @@ def _start_browser_signin_via_fetch(page, email: str, device_id: str, log) -> st
 # ---------------------------------------------------------------------------
 
 
-def _browser_registration_flow(page, email: str, password: str, otp_callback: Callable[[], str],
-                               log) -> dict:
+def _browser_registration_flow(
+    page,
+    email: str,
+    password: str,
+    otp_callback: Callable[[], str],
+    log,
+    *,
+    bind_totp_2fa: bool = False,
+) -> dict:
     device_id = str(uuid.uuid4())
     log(f"开始 ChatGPT 浏览器注册: {email}")
 
@@ -649,7 +703,28 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback: Ca
                     "注册会话已建立，但 OpenAI 端未完成密码设置；拒绝保存无密码账号"
                 )
             log("注册完成：会话已建立")
-            return _build_session_result(page, _fetch_session_via_page(page, log), log)
+            result = _build_session_result(page, _fetch_session_via_page(page, log), log)
+            if bind_totp_2fa:
+                log("正在复用注册浏览器会话绑定 TOTP 2FA...")
+                try:
+                    secret = _bind_totp_via_page(page, str(result.get("access_token") or ""))
+                except Exception as exc:
+                    result["totp_2fa"] = {
+                        "requested": True,
+                        "bound": False,
+                        "secret": "",
+                        "error": str(exc)[:200],
+                    }
+                    log(f"浏览器会话内 TOTP 2FA 绑定失败: {exc}", level="warning")
+                else:
+                    result["totp_2fa"] = {
+                        "requested": True,
+                        "bound": True,
+                        "secret": secret,
+                        "error": "",
+                    }
+                    log("浏览器会话内 TOTP 2FA 绑定并激活成功")
+            return result
 
         if stage == "password":
             if password_submitted:
@@ -805,11 +880,13 @@ class ChatGPTBrowserRegister:
         headless: bool,
         proxy: str | None = None,
         otp_callback: Callable[[], str] | None = None,
+        bind_totp_2fa: bool = False,
         log_fn: Callable[[str], None] = print,
     ):
         self.headless = bool(headless)
         self.proxy = proxy
         self.otp_callback = otp_callback
+        self.bind_totp_2fa = bool(bind_totp_2fa)
         self.log = log_fn
 
     def run(self, email: str, password: str) -> dict:
@@ -833,12 +910,14 @@ class ChatGPTBrowserRegister:
                 password,
                 self.otp_callback or (lambda: ""),
                 self.log,
+                bind_totp_2fa=self.bind_totp_2fa,
             )
             result = dict(final)
             result.update({
                 "email": email,
                 "password": password,
                 "platform": "chatgpt",
+                "_registration_proxy": self.proxy or "",
             })
             return result
 

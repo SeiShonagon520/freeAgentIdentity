@@ -329,6 +329,7 @@ class BrowserProcessPool:
         proxy_rotate_callback: Callable[[], str | None] | None = None,
         max_proxy_attempts: int = 6,
         otp_callback: Callable[[], str],
+        bind_totp_2fa: bool = False,
         log_fn: Callable[..., None],
     ) -> dict:
         if self._closed:
@@ -346,6 +347,7 @@ class BrowserProcessPool:
                 proxy_rotate_callback=proxy_rotate_callback,
                 max_proxy_attempts=max_proxy_attempts,
                 otp_callback=otp_callback,
+                bind_totp_2fa=bind_totp_2fa,
                 log_fn=log_fn,
             ),
             self._loop,
@@ -379,6 +381,7 @@ class BrowserProcessPool:
         proxy_rotate_callback,
         max_proxy_attempts,
         otp_callback,
+        bind_totp_2fa,
         log_fn,
     ) -> dict:
         state: dict[str, Any] = {}
@@ -390,6 +393,7 @@ class BrowserProcessPool:
                 proxy_rotate_callback=proxy_rotate_callback,
                 max_proxy_attempts=max_proxy_attempts,
                 otp_callback=otp_callback,
+                bind_totp_2fa=bind_totp_2fa,
                 log_fn=log_fn,
                 state=state,
             )
@@ -430,6 +434,7 @@ class BrowserProcessPool:
         proxy_rotate_callback,
         max_proxy_attempts,
         otp_callback,
+        bind_totp_2fa,
         log_fn,
         state: dict[str, Any],
     ) -> dict:
@@ -459,6 +464,7 @@ class BrowserProcessPool:
                                         password=password,
                                         proxy=current_proxy,
                                         otp_callback=otp_callback,
+                                        bind_totp_2fa=bind_totp_2fa,
                                         log=log_fn,
                                         startup_gate=self._startup_sem,
                                         close_timeout_seconds=self.context_close_timeout,

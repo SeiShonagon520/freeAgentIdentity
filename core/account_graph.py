@@ -46,6 +46,7 @@ PLATFORM_CREDENTIAL_TYPES: dict[str, str] = {
     "cookies": "cookie",
     "cookie": "cookie",
     "api_key": "secret",
+    "totp_secret": "secret",
     "wos_session": "token",
     "sso": "cookie",
     "sso_rw": "cookie",

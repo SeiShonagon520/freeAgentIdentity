@@ -147,24 +147,34 @@ class ChatGPTPlatform(BasePlatform):
         password: str = "",
         user_id: str = "",
     ) -> RegistrationResult:
+        totp_result = result.get("totp_2fa") or {}
+        if not isinstance(totp_result, dict):
+            totp_result = {}
+        extra = {
+            "account_id": result.get("account_id", ""),
+            "access_token": result.get("access_token", ""),
+            "refresh_token": result.get("refresh_token", ""),
+            "id_token": result.get("id_token", ""),
+            "client_id": result.get("client_id", ""),
+            "session_token": result.get("session_token", ""),
+            "workspace_id": result.get("workspace_id", ""),
+            "cookies": result.get("cookies", ""),
+            "profile": result.get("profile", {}),
+            "expires_at": result.get("expires_at", ""),
+        }
+        if totp_result.get("bound") and totp_result.get("secret"):
+            extra["totp_secret"] = str(totp_result["secret"]).strip()
+        if totp_result.get("requested"):
+            extra["_registration_totp_error"] = str(totp_result.get("error") or "")
+        if result.get("_registration_proxy"):
+            extra["_registration_proxy"] = str(result["_registration_proxy"])
         return RegistrationResult(
             email=result.get("email", ""),
             password=password or result.get("password", ""),
             user_id=user_id or result.get("account_id", ""),
             token=result.get("access_token", ""),
             status=AccountStatus.REGISTERED,
-            extra={
-                "account_id": result.get("account_id", ""),
-                "access_token": result.get("access_token", ""),
-                "refresh_token": result.get("refresh_token", ""),
-                "id_token": result.get("id_token", ""),
-                "client_id": result.get("client_id", ""),
-                "session_token": result.get("session_token", ""),
-                "workspace_id": result.get("workspace_id", ""),
-                "cookies": result.get("cookies", ""),
-                "profile": result.get("profile", {}),
-                "expires_at": result.get("expires_at", ""),
-            },
+            extra=extra,
         )
 
     def build_protocol_mailbox_adapter(self):
@@ -254,6 +264,7 @@ class ChatGPTPlatform(BasePlatform):
                                 1,
                             ),
                             otp_callback=artifacts.otp_callback or (lambda: ""),
+                            bind_totp_2fa=bool(ctx.extra.get("bind_totp_2fa")),
                             log_fn=_log(ctx),
                         )
 
@@ -263,6 +274,7 @@ class ChatGPTPlatform(BasePlatform):
                 headless=False,
                 proxy=ctx.proxy,
                 otp_callback=artifacts.otp_callback,
+                bind_totp_2fa=bool(ctx.extra.get("bind_totp_2fa")),
                 log_fn=_log(ctx),
             )
 

@@ -47,6 +47,7 @@ from .browser_register import (
     _is_transient_nav_error,
 )
 from .constants import CHATGPT_APP
+from .mfa import MFA_ACTIVATE_URL, MFA_ENROLL_URL, prepare_totp_activation
 
 # context 级指纹：随机选一个桌面 OS，配合随机 preset 让同浏览器内每个
 # context 呈现不同 navigator.platform / screen / canvas / font 噪声。
@@ -494,6 +495,57 @@ async def _browser_fetch(page, url: str, *, method: str = "GET", headers: dict |
     return payload if isinstance(payload, dict) else {"ok": False, "status": 0, "url": "", "text": ""}
 
 
+async def _browser_mfa_json(
+    page,
+    url: str,
+    access_token: str,
+    *,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    response = await _browser_fetch(
+        page,
+        url,
+        method="POST",
+        headers={
+            "accept": "application/json",
+            "authorization": f"Bearer {access_token}",
+            "content-type": "application/json",
+        },
+        body=json.dumps(body, separators=(",", ":")),
+    )
+    status = int(response.get("status") or 0)
+    text = str(response.get("text") or "")
+    if status < 200 or status >= 300:
+        raise RuntimeError(f"浏览器内 TOTP API 返回 HTTP {status}: {text[:160]}")
+    try:
+        payload = json.loads(text)
+    except Exception as exc:
+        raise RuntimeError(f"浏览器内 TOTP API 返回非 JSON: {text[:160]}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("浏览器内 TOTP API 返回格式无效")
+    return payload
+
+
+async def _bind_totp_via_page(page, access_token: str) -> str:
+    """Bind TOTP before the registration context and its fingerprint close."""
+    enrollment = await _browser_mfa_json(
+        page,
+        MFA_ENROLL_URL,
+        access_token,
+        body={"factor_type": "totp"},
+    )
+    secret, _session_id, activation_body = prepare_totp_activation(enrollment)
+    activation = await _browser_mfa_json(
+        page,
+        MFA_ACTIVATE_URL,
+        access_token,
+        body=activation_body,
+    )
+    if not activation.get("success"):
+        raise RuntimeError(f"浏览器内 TOTP 激活未确认: {str(activation)[:160]}")
+    return secret
+
+
 async def _fetch_session_via_page(page, log) -> dict:
     session_url = f"{CHATGPT_APP}/api/auth/session"
     deadline = time.time() + 45
@@ -567,6 +619,7 @@ async def _browser_registration_flow(
     otp_callback: Callable[[], str],
     log,
     startup_gate: asyncio.Semaphore | None = None,
+    bind_totp_2fa: bool = False,
 ) -> dict:
     log(f"开始 ChatGPT 浏览器注册: {email}")
 
@@ -672,7 +725,35 @@ async def _browser_registration_flow(
                     "注册会话已建立，但 OpenAI 端未完成密码设置；拒绝保存无密码账号"
                 )
             log("注册完成：会话已建立")
-            return await _build_session_result(page, await _fetch_session_via_page(page, log), log)
+            result = await _build_session_result(
+                page,
+                await _fetch_session_via_page(page, log),
+                log,
+            )
+            if bind_totp_2fa:
+                log("正在复用注册浏览器会话绑定 TOTP 2FA...")
+                try:
+                    secret = await _bind_totp_via_page(
+                        page,
+                        str(result.get("access_token") or ""),
+                    )
+                except Exception as exc:
+                    result["totp_2fa"] = {
+                        "requested": True,
+                        "bound": False,
+                        "secret": "",
+                        "error": str(exc)[:200],
+                    }
+                    log(f"浏览器会话内 TOTP 2FA 绑定失败: {exc}", level="warning")
+                else:
+                    result["totp_2fa"] = {
+                        "requested": True,
+                        "bound": True,
+                        "secret": secret,
+                        "error": "",
+                    }
+                    log("浏览器会话内 TOTP 2FA 绑定并激活成功")
+            return result
 
         if stage == "password":
             if password_submitted:
@@ -860,6 +941,7 @@ async def _browser_registration_flow(
 async def register_in_context(browser, *, email: str, password: str, proxy: str | None,
                               otp_callback: Callable[[], str], log,
                               startup_gate: asyncio.Semaphore | None = None,
+                              bind_totp_2fa: bool = False,
                               close_timeout_seconds: float = 15.0) -> dict:
     """在共享浏览器进程里开一个独立指纹 context，跑完注册并关闭 context。"""
     context = await AsyncNewContext(
@@ -884,9 +966,15 @@ async def register_in_context(browser, *, email: str, password: str, proxy: str 
                 otp_callback,
                 log,
                 startup_gate=startup_gate,
+                bind_totp_2fa=bind_totp_2fa,
             )
             result = dict(final)
-            result.update({"email": email, "password": password, "platform": "chatgpt"})
+            result.update({
+                "email": email,
+                "password": password,
+                "platform": "chatgpt",
+                "_registration_proxy": proxy or "",
+            })
             return result
         except Exception as exc:
             await _capture_failure(page, reason=str(exc), log=log)
