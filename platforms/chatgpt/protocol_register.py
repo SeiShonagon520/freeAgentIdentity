@@ -1316,6 +1316,42 @@ class ChatGPTProtocolRegister:
             "expires_at": payload.get("expires") or "",
         }
 
+    def _finalize_registration_result(self, result: dict) -> dict:
+        """Bind TOTP before the registration session is closed.
+
+        The registration session carries the exact cookies, device identity,
+        TLS fingerprint and proxy route that created the account. Reusing it
+        for MFA avoids intermittent 403 responses from a fresh follow-up
+        session and makes protocol registration obey the same password+2FA
+        invariant as browser registration.
+        """
+        from platforms.chatgpt.mfa import bind_totp_2fa
+
+        access_token = str(result.get("access_token") or "").strip()
+        if not access_token:
+            raise RuntimeError("协议注册结果缺少 access token，无法绑定 TOTP 2FA")
+        try:
+            totp = bind_totp_2fa(self.session, access_token)
+        except Exception as exc:
+            raise RuntimeError(f"协议注册 TOTP 2FA 绑定失败: {exc}") from exc
+        secret = str(totp.get("secret") or "").strip()
+        if not bool(totp.get("activated")) or not secret:
+            raise RuntimeError(
+                "协议注册 TOTP 2FA 激活未确认，拒绝保存账号: "
+                f"{str(totp.get('result') or totp)[:160]}"
+            )
+        result["password_registered"] = True
+        result["totp_2fa"] = {
+            "requested": True,
+            "bound": True,
+            "secret": secret,
+            "error": "",
+        }
+        if self.proxy:
+            result["_registration_proxy"] = self.proxy
+        self.log("协议注册会话内 TOTP 2FA 绑定并激活成功")
+        return result
+
     def login(self, *, email: str, password: str) -> dict:
         """Log in through the same OAuth bootstrap used by registration."""
         if not str(email or "").strip() or not str(password or ""):
@@ -1371,8 +1407,9 @@ class ChatGPTProtocolRegister:
                     headers={"user-agent": self.user_agent},
                     allow_redirects=True,
                 )
-            result = self._session_result(email, password)
-            result["password_registered"] = True
+            result = self._finalize_registration_result(
+                self._session_result(email, password)
+            )
             self.log("ChatGPT Web 兼容注册完成")
             return result
         finally:
@@ -1535,9 +1572,9 @@ class ChatGPTProtocolRegister:
             email=email,
             continue_url=_authorization_continue_url(created),
         )
-        result = self._codex_registration_result(email, password, tokens)
-        result["password_registered"] = True
-        return result
+        return self._finalize_registration_result(
+            self._codex_registration_result(email, password, tokens)
+        )
 
 
     def run(self, *, email: str, password: str) -> dict:

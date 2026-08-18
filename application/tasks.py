@@ -852,6 +852,19 @@ def _access_token_for_account(account: Any) -> str:
     ).strip()
 
 
+def _cookie_header_value(value: Any) -> str:
+    """Normalize exported browser/protocol cookies for an HTTP Cookie header."""
+    if isinstance(value, dict):
+        return "; ".join(
+            f"{str(name).strip()}={str(cookie).strip()}"
+            for name, cookie in value.items()
+            if str(name).strip()
+        )
+    if isinstance(value, (list, tuple)):
+        return "; ".join(str(item).strip() for item in value if str(item).strip())
+    return str(value or "").strip()
+
+
 def _persist_totp_secret(account_id: int, secret: str) -> None:
     """Save a TOTP 2FA secret to the account's credentials store."""
     if not secret:
@@ -885,7 +898,7 @@ def _bind_registered_account_totp(
         "impersonate": PROTOCOL_CHROME_IMPERSONATE,
         "timeout": 30,
     }
-    cookies = str(account_extra.get("cookies") or "").strip()
+    cookies = _cookie_header_value(account_extra.get("cookies"))
     if cookies:
         session_kwargs["headers"] = {"Cookie": cookies}
     mfa_session = _cffi_requests.Session(**session_kwargs)

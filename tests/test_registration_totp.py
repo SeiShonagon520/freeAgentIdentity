@@ -177,6 +177,44 @@ def test_bind_registered_account_totp_reuses_exported_browser_cookies_before_sav
     assert session.closed is True
 
 
+def test_bind_registered_account_totp_serializes_protocol_cookie_mapping(monkeypatch):
+    captured = {}
+    session = SimpleNamespace(proxies={}, closed=False)
+    session.close = lambda: setattr(session, "closed", True)
+
+    def make_session(**kwargs):
+        captured.update(kwargs)
+        return session
+
+    monkeypatch.setattr("curl_cffi.requests.Session", make_session)
+    monkeypatch.setattr(
+        "platforms.chatgpt.mfa.bind_totp_2fa",
+        lambda *_args, **_kwargs: {
+            "activated": True,
+            "secret": "MAPPEDCOOKIESECRET",
+            "result": {"success": True},
+        },
+    )
+
+    secret = tasks_module._bind_registered_account_totp(
+        SimpleNamespace(
+            token="access-token",
+            extra={
+                "cookies": {
+                    "oai-did": "device",
+                    "__Secure-next-auth.session-token": "session",
+                }
+            },
+        )
+    )
+
+    assert secret == "MAPPEDCOOKIESECRET"
+    assert captured["headers"] == {
+        "Cookie": "oai-did=device; __Secure-next-auth.session-token=session"
+    }
+    assert session.closed is True
+
+
 def test_chatgpt_result_maps_browser_totp_secret_to_platform_credentials():
     platform = object.__new__(ChatGPTPlatform)
     result = platform._map_chatgpt_result(

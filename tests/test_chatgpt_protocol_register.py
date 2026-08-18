@@ -183,6 +183,18 @@ def _install_valid_web_session_mint(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _install_valid_protocol_totp(monkeypatch):
+    monkeypatch.setattr(
+        "platforms.chatgpt.mfa.bind_totp_2fa",
+        lambda *_args, **_kwargs: {
+            "activated": True,
+            "secret": "TESTPROTOCOLTOTP",
+            "result": {"success": True},
+        },
+    )
+
+
 def test_protocol_register_completes_email_flow_without_browser(monkeypatch):
     _install_valid_web_session_mint(monkeypatch)
     session = _FakeSession()
@@ -204,6 +216,12 @@ def test_protocol_register_completes_email_flow_without_browser(monkeypatch):
     assert result["account_id"] == "account-123"
     assert result["workspace_id"] == "account-123"
     assert result["password_registered"] is True
+    assert result["totp_2fa"] == {
+        "requested": True,
+        "bound": True,
+        "secret": "TESTPROTOCOLTOTP",
+        "error": "",
+    }
     assert session.password_body == {
         "username": "user@outlook.com",
         "password": "StrongPass123!",
@@ -327,6 +345,24 @@ def test_protocol_register_rejects_otp_first_flow_when_password_creation_fails(m
         method == "POST" and url == OPENAI_API_ENDPOINTS["validate_otp"]
         for method, url, _kwargs in session.calls
     )
+
+
+def test_protocol_register_fails_when_same_session_totp_binding_is_rejected(monkeypatch):
+    _install_valid_web_session_mint(monkeypatch)
+    monkeypatch.setattr(
+        "platforms.chatgpt.mfa.bind_totp_2fa",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("HTTP 403")),
+    )
+    session = _FakeSession()
+    worker = ChatGPTProtocolRegister(
+        session=session,
+        otp_callback=lambda: "123456",
+    )
+
+    with pytest.raises(RuntimeError, match="协议注册 TOTP 2FA 绑定失败"):
+        worker.run(email="totp-required@example.com", password="StrongPass123!")
+
+    assert session.closed is True
 
 
 def test_protocol_register_lets_create_account_decide_after_add_phone_hint():
