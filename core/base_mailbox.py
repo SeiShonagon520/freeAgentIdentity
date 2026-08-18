@@ -46,6 +46,14 @@ class BaseMailbox(ABC):
     ) -> str:
         raise NotImplementedError(f"{self.__class__.__name__} 暂不支持 wait_for_link()")
 
+    def commit_email(self, account: MailboxAccount) -> bool:
+        """Finalize a leased mailbox after registration succeeds."""
+        return False
+
+    def release_email(self, account: MailboxAccount) -> bool:
+        """Release a leased mailbox after registration fails."""
+        return False
+
 
 class FallbackMailbox(BaseMailbox):
     """默认邮箱不可用时，依次尝试其他已启用邮箱。"""
@@ -128,6 +136,20 @@ class FallbackMailbox(BaseMailbox):
             timeout=timeout,
             before_ids=before_ids,
         )
+
+    def commit_email(self, account: MailboxAccount) -> bool:
+        mailbox = self._resolve(account)
+        try:
+            return bool(mailbox.commit_email(account))
+        finally:
+            self._accounts.pop(account.email, None)
+
+    def release_email(self, account: MailboxAccount) -> bool:
+        mailbox = self._resolve(account)
+        try:
+            return bool(mailbox.release_email(account))
+        finally:
+            self._accounts.pop(account.email, None)
 
 
 def _extract_verification_link(text: str, keyword: str = "") -> str | None:

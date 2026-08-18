@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import uuid
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -11,7 +12,13 @@ from sqlalchemy import func, or_, text
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlmodel import Session, select
 
-from core.db import MicrosoftMailboxModel, ProviderSettingModel, engine
+from core.db import (
+    MicrosoftMailboxLeaseModel,
+    MicrosoftMailboxModel,
+    ProviderSettingModel,
+    RegisteredEmailHistoryModel,
+    engine,
+)
 from core.secret_store import decrypt_secret, encrypt_secret
 
 
@@ -49,6 +56,8 @@ class MicrosoftMailboxRecord:
     use_count: int
     max_uses: int
     status: str
+    alias_index: int = 0
+    lease_token: str = ""
 
 
 class MicrosoftMailboxRepository:
@@ -79,6 +88,8 @@ class MicrosoftMailboxRepository:
             use_count=int(getter("use_count") or 0),
             max_uses=max(int(getter("max_uses") or 6), 1),
             status=str(getter("status") or "available"),
+            alias_index=int(getter("lease_alias_index") or getter("alias_index") or 0),
+            lease_token=str(getter("lease_token") or ""),
         )
 
     @staticmethod
@@ -112,6 +123,7 @@ class MicrosoftMailboxRepository:
             "totp_secret_ciphertext": encrypt_secret(getattr(entry, "totp_secret", "")),
             "source_format": str(getattr(entry, "source_format", "") or ""),
             "max_uses": max(int(max_uses or 6), 1),
+            "allocation_version": 1,
             "created_at": now,
             "updated_at": now,
         }
@@ -182,7 +194,12 @@ class MicrosoftMailboxRepository:
             **stats,
         }
 
-    def reserve(self, *, allow_reuse: bool = False) -> MicrosoftMailboxRecord:
+    def reserve(
+        self,
+        *,
+        allow_reuse: bool = False,
+        lease_seconds: int = 7200,
+    ) -> MicrosoftMailboxRecord:
         if allow_reuse:
             with Session(engine) as session:
                 row = session.exec(
@@ -195,47 +212,221 @@ class MicrosoftMailboxRepository:
                 raise RuntimeError("本地微软邮箱池为空")
             return self._record(row)
 
-        now = _utcnow().isoformat()
-        statement = text(
-            """
-            UPDATE microsoft_mailboxes
-            SET
-                use_count = use_count + 1,
-                status = CASE
-                    WHEN use_count + 1 >= max_uses THEN 'exhausted'
-                    ELSE 'available'
-                END,
-                last_reserved_at = :now,
-                updated_at = :now
-            WHERE id = (
-                SELECT id
-                FROM microsoft_mailboxes
-                WHERE status = 'available' AND use_count < max_uses
-                ORDER BY use_count, id
-                LIMIT 1
+        now = _utcnow()
+        expires_at = now + timedelta(seconds=max(int(lease_seconds or 0), 60))
+        lease_token = uuid.uuid4().hex
+        connection = engine.connect()
+        row = None
+        try:
+            # Serialize slot selection and insertion so concurrent workers
+            # cannot lease the same parent/alias slot.
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM microsoft_mailbox_leases
+                    WHERE status = 'reserved'
+                      AND expires_at IS NOT NULL
+                      AND expires_at <= :now
+                    """
+                ),
+                {"now": now},
             )
-            RETURNING *
-            """
-        )
-        with engine.begin() as connection:
-            row = connection.execute(statement, {"now": now}).mappings().first()
+            row = connection.execute(
+                text(
+                    """
+                    WITH RECURSIVE alias_slots(alias_index) AS (
+                        SELECT 1
+                        UNION ALL
+                        SELECT alias_index + 1
+                        FROM alias_slots
+                        WHERE alias_index < 256
+                    )
+                    SELECT
+                        m.*,
+                        alias_slots.alias_index AS lease_alias_index
+                    FROM microsoft_mailboxes AS m
+                    JOIN alias_slots ON alias_slots.alias_index <= m.max_uses
+                    LEFT JOIN microsoft_mailbox_leases AS lease
+                      ON lease.mailbox_id = m.id
+                     AND lease.alias_index = alias_slots.alias_index
+                    WHERE m.status != 'disabled'
+                      AND lease.id IS NULL
+                    ORDER BY m.use_count, m.id, alias_slots.alias_index
+                    LIMIT 1
+                    """
+                )
+            ).mappings().first()
+            if row is not None:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO microsoft_mailbox_leases (
+                            mailbox_id,
+                            alias_index,
+                            lease_token,
+                            status,
+                            expires_at,
+                            created_at,
+                            updated_at
+                        ) VALUES (
+                            :mailbox_id,
+                            :alias_index,
+                            :lease_token,
+                            'reserved',
+                            :expires_at,
+                            :now,
+                            :now
+                        )
+                        """
+                    ),
+                    {
+                        "mailbox_id": int(row["id"]),
+                        "alias_index": int(row["lease_alias_index"]),
+                        "lease_token": lease_token,
+                        "expires_at": expires_at,
+                        "now": now,
+                    },
+                )
+                connection.execute(
+                    text(
+                        """
+                        UPDATE microsoft_mailboxes
+                        SET last_reserved_at = :now, updated_at = :now
+                        WHERE id = :mailbox_id
+                        """
+                    ),
+                    {"now": now, "mailbox_id": int(row["id"])},
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
         if row is None:
             stats = self.stats()
             raise RuntimeError(
                 "本地微软邮箱池已用尽: "
                 f"total={stats['total']}, capacity={stats['capacity']}"
             )
-        return self._record(row)
+        payload = dict(row)
+        payload["lease_token"] = lease_token
+        return self._record(payload)
+
+    def commit(self, lease_token: str) -> bool:
+        token = str(lease_token or "").strip()
+        if not token:
+            return False
+        now = _utcnow()
+        connection = engine.connect()
+        try:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            lease = connection.execute(
+                text(
+                    """
+                    SELECT mailbox_id, status
+                    FROM microsoft_mailbox_leases
+                    WHERE lease_token = :lease_token
+                    """
+                ),
+                {"lease_token": token},
+            ).mappings().first()
+            if lease is None:
+                connection.rollback()
+                return False
+            mailbox_id = int(lease["mailbox_id"])
+            if str(lease["status"]) != "committed":
+                connection.execute(
+                    text(
+                        """
+                        UPDATE microsoft_mailbox_leases
+                        SET status = 'committed', expires_at = NULL, updated_at = :now
+                        WHERE lease_token = :lease_token AND status = 'reserved'
+                        """
+                    ),
+                    {"lease_token": token, "now": now},
+                )
+            self._sync_usage(connection, mailbox_id=mailbox_id, now=now)
+            connection.commit()
+            return True
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def release(self, lease_token: str) -> bool:
+        token = str(lease_token or "").strip()
+        if not token:
+            return False
+        with engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    """
+                    DELETE FROM microsoft_mailbox_leases
+                    WHERE lease_token = :lease_token AND status = 'reserved'
+                    """
+                ),
+                {"lease_token": token},
+            )
+        return bool(result.rowcount)
+
+    @staticmethod
+    def _sync_usage(connection, *, mailbox_id: int, now: datetime) -> None:
+        connection.execute(
+            text(
+                """
+                UPDATE microsoft_mailboxes
+                SET
+                    use_count = (
+                        SELECT COUNT(*)
+                        FROM microsoft_mailbox_leases
+                        WHERE mailbox_id = :mailbox_id AND status = 'committed'
+                    ),
+                    status = CASE
+                        WHEN status = 'disabled' THEN 'disabled'
+                        WHEN (
+                            SELECT COUNT(*)
+                            FROM microsoft_mailbox_leases
+                            WHERE mailbox_id = :mailbox_id AND status = 'committed'
+                        ) >= max_uses THEN 'exhausted'
+                        ELSE 'available'
+                    END,
+                    updated_at = :now
+                WHERE id = :mailbox_id
+                """
+            ),
+            {"mailbox_id": int(mailbox_id), "now": now},
+        )
 
     def peek(self) -> MicrosoftMailboxRecord:
-        with Session(engine) as session:
-            row = session.exec(
-                select(MicrosoftMailboxModel)
-                .where(MicrosoftMailboxModel.status == "available")
-                .where(MicrosoftMailboxModel.use_count < MicrosoftMailboxModel.max_uses)
-                .order_by(MicrosoftMailboxModel.use_count, MicrosoftMailboxModel.id)
-                .limit(1)
-            ).first()
+        with engine.begin() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    WITH RECURSIVE alias_slots(alias_index) AS (
+                        SELECT 1
+                        UNION ALL
+                        SELECT alias_index + 1
+                        FROM alias_slots
+                        WHERE alias_index < 256
+                    )
+                    SELECT
+                        m.*,
+                        alias_slots.alias_index AS lease_alias_index
+                    FROM microsoft_mailboxes AS m
+                    JOIN alias_slots ON alias_slots.alias_index <= m.max_uses
+                    LEFT JOIN microsoft_mailbox_leases AS lease
+                      ON lease.mailbox_id = m.id
+                     AND lease.alias_index = alias_slots.alias_index
+                    WHERE m.status != 'disabled'
+                      AND lease.id IS NULL
+                    ORDER BY m.use_count, m.id, alias_slots.alias_index
+                    LIMIT 1
+                    """
+                )
+            ).mappings().first()
         if row is None:
             stats = self.stats()
             raise RuntimeError(
@@ -274,6 +465,7 @@ class MicrosoftMailboxRepository:
         return bool(result.rowcount)
 
     def stats(self) -> dict:
+        now = _utcnow()
         with Session(engine) as session:
             total, capacity, used, available = session.exec(
                 select(
@@ -293,11 +485,22 @@ class MicrosoftMailboxRepository:
                     MicrosoftMailboxModel.status == "exhausted"
                 )
             ).one()
+            reserved = session.exec(
+                select(func.count(MicrosoftMailboxLeaseModel.id))
+                .join(
+                    MicrosoftMailboxModel,
+                    MicrosoftMailboxModel.id == MicrosoftMailboxLeaseModel.mailbox_id,
+                )
+                .where(MicrosoftMailboxModel.status != "disabled")
+                .where(MicrosoftMailboxLeaseModel.status == "reserved")
+                .where(MicrosoftMailboxLeaseModel.expires_at > now)
+            ).one()
         return {
             "total": int(total or 0),
             "capacity": int(capacity or 0),
             "used": int(used or 0),
-            "remaining": int(available or 0),
+            "reserved": int(reserved or 0),
+            "remaining": max(int(available or 0) - int(reserved or 0), 0),
             "exhausted": int(exhausted or 0),
         }
 
@@ -350,32 +553,139 @@ class MicrosoftMailboxRepository:
         }
 
     def apply_minimum_usage(self, usage_by_email: dict[str, int]) -> None:
-        payloads = [
-            {"email_key": _email_key(email), "use_count": max(int(count or 0), 0)}
-            for email, count in usage_by_email.items()
-            if _email_key(email)
-        ]
-        if not payloads:
-            return
-        statement = text(
-            """
-            UPDATE microsoft_mailboxes
-            SET
-                use_count = MIN(max_uses, MAX(use_count, :use_count)),
-                status = CASE
-                    WHEN MIN(max_uses, MAX(use_count, :use_count)) >= max_uses
-                        THEN 'exhausted'
-                    ELSE 'available'
-                END,
-                updated_at = :updated_at
-            WHERE email_key = :email_key
-            """
-        )
-        now = _utcnow().isoformat()
-        for payload in payloads:
-            payload["updated_at"] = now
-        with engine.begin() as connection:
-            connection.execute(statement, payloads)
+        now = _utcnow()
+        with Session(engine) as session:
+            for email, count in usage_by_email.items():
+                key = _email_key(email)
+                if not key:
+                    continue
+                mailbox = session.exec(
+                    select(MicrosoftMailboxModel).where(
+                        MicrosoftMailboxModel.email_key == key
+                    )
+                ).first()
+                if mailbox is None:
+                    continue
+                target = min(max(int(count or 0), 0), int(mailbox.max_uses or 1))
+                occupied = {
+                    int(value)
+                    for value in session.exec(
+                        select(MicrosoftMailboxLeaseModel.alias_index).where(
+                            MicrosoftMailboxLeaseModel.mailbox_id == mailbox.id
+                        )
+                    ).all()
+                }
+                for alias_index in range(1, target + 1):
+                    if alias_index in occupied:
+                        continue
+                    session.add(
+                        MicrosoftMailboxLeaseModel(
+                            mailbox_id=int(mailbox.id or 0),
+                            alias_index=alias_index,
+                            lease_token=f"legacy:{mailbox.id}:{alias_index}",
+                            status="committed",
+                            expires_at=None,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                mailbox.use_count = max(int(mailbox.use_count or 0), target)
+                if mailbox.status != "disabled":
+                    mailbox.status = (
+                        "exhausted"
+                        if mailbox.use_count >= int(mailbox.max_uses or 1)
+                        else "available"
+                    )
+                mailbox.updated_at = now
+                session.add(mailbox)
+            session.commit()
+
+def _parent_email_key(email: str) -> str:
+    local_part, separator, domain = _email_key(email).rpartition("@")
+    if not separator:
+        return _email_key(email)
+    return f"{local_part.split('+', 1)[0]}@{domain}"
+
+
+def migrate_microsoft_mailbox_usage_leases() -> dict:
+    """Convert eager legacy usage counts into committed-success leases.
+
+    Legacy versions incremented ``use_count`` before the browser was even
+    started.  Rebuild those counts from durable successful-registration
+    history, then use leases for all future attempts.  Reserved leases are
+    process-local work, so any that survived a service restart are safe to
+    release here.
+    """
+
+    now = _utcnow()
+    with Session(engine) as session:
+        stale_reservations = session.exec(
+            select(MicrosoftMailboxLeaseModel).where(
+                MicrosoftMailboxLeaseModel.status == "reserved"
+            )
+        ).all()
+        for lease in stale_reservations:
+            session.delete(lease)
+
+        successful_by_parent: Counter[str] = Counter()
+        for email in session.exec(select(RegisteredEmailHistoryModel.email)).all():
+            parent = _parent_email_key(email)
+            if parent:
+                successful_by_parent[parent] += 1
+        mailboxes = session.exec(
+            select(MicrosoftMailboxModel).where(
+                MicrosoftMailboxModel.allocation_version < 1
+            )
+        ).all()
+        reclaimed = 0
+        confirmed_total = 0
+        for mailbox in mailboxes:
+            old_count = max(int(mailbox.use_count or 0), 0)
+            confirmed = min(
+                successful_by_parent.get(_parent_email_key(mailbox.email), 0),
+                max(int(mailbox.max_uses or 1), 1),
+            )
+            reclaimed += max(old_count - confirmed, 0)
+            confirmed_total += confirmed
+
+            leases = session.exec(
+                select(MicrosoftMailboxLeaseModel).where(
+                    MicrosoftMailboxLeaseModel.mailbox_id == mailbox.id
+                )
+            ).all()
+            for lease in leases:
+                session.delete(lease)
+            session.flush()
+            for alias_index in range(1, confirmed + 1):
+                session.add(
+                    MicrosoftMailboxLeaseModel(
+                        mailbox_id=int(mailbox.id or 0),
+                        alias_index=alias_index,
+                        lease_token=f"reconciled:{mailbox.id}:{alias_index}",
+                        status="committed",
+                        expires_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            mailbox.use_count = confirmed
+            mailbox.allocation_version = 1
+            if mailbox.status != "disabled":
+                mailbox.status = (
+                    "exhausted"
+                    if confirmed >= max(int(mailbox.max_uses or 1), 1)
+                    else "available"
+                )
+            mailbox.updated_at = now
+            session.add(mailbox)
+        session.commit()
+
+    return {
+        "mailboxes": len(mailboxes),
+        "used": confirmed_total,
+        "reclaimed": reclaimed,
+        "released_reservations": len(stale_reservations),
+    }
 
 
 def migrate_legacy_microsoft_mailbox_pool() -> dict:

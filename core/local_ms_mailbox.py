@@ -340,9 +340,11 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
 
     def _candidate_from_record(self, record, *, reserved: bool) -> LocalMicrosoftMailboxCandidate:
         entry = self._entry_from_record(record)
-        alias_index = int(record.use_count or 0)
-        if not reserved and not self.allow_reuse:
-            alias_index += 1
+        alias_index = int(getattr(record, "alias_index", 0) or 0)
+        if not alias_index:
+            alias_index = int(record.use_count or 0)
+            if not reserved and not self.allow_reuse:
+                alias_index += 1
         if self.allow_reuse:
             alias_index = 1
         alias_index = min(max(alias_index, 1), int(record.max_uses or self.alias_count))
@@ -363,7 +365,12 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
     def get_email(self) -> MailboxAccount:
         self._ensure_legacy_source_imported()
         record = self._repository().reserve(allow_reuse=self.allow_reuse)
-        candidate = self._candidate_from_record(record, reserved=True)
+        try:
+            candidate = self._candidate_from_record(record, reserved=True)
+        except BaseException:
+            if getattr(record, "lease_token", ""):
+                self._repository().release(record.lease_token)
+            raise
 
         entry = candidate.entry
         credentials = entry.credentials()
@@ -372,6 +379,7 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
             email=candidate.email,
             account_id=candidate.key,
             extra={
+                "_mailbox_lease_token": str(getattr(record, "lease_token", "") or ""),
                 "provider_account": {
                     "provider_type": "mailbox",
                     "provider_name": "local_ms_pool",
@@ -404,6 +412,34 @@ class LocalMicrosoftMailboxPool(BaseMailbox):
                 },
             },
         )
+
+    @staticmethod
+    def _lease_token(account: MailboxAccount) -> str:
+        return str((getattr(account, "extra", {}) or {}).get("_mailbox_lease_token") or "")
+
+    def commit_email(self, account: MailboxAccount) -> bool:
+        token = self._lease_token(account)
+        if not token:
+            return False
+        committed = self._repository().commit(token)
+        if committed:
+            account.extra = dict(account.extra or {})
+            account.extra.pop("_mailbox_lease_token", None)
+            resource = account.extra.get("provider_resource")
+            if isinstance(resource, dict):
+                metadata = dict(resource.get("metadata") or {})
+                metadata["reserved"] = False
+                resource["metadata"] = metadata
+        return committed
+
+    def release_email(self, account: MailboxAccount) -> bool:
+        token = self._lease_token(account)
+        if not token:
+            return False
+        released = self._repository().release(token)
+        account.extra = dict(account.extra or {})
+        account.extra.pop("_mailbox_lease_token", None)
+        return released
 
     def _entry_for_account(self, account: MailboxAccount) -> LocalMicrosoftMailboxEntry:
         account_email = str(getattr(account, "email", "") or "").strip().lower()

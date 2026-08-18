@@ -73,6 +73,8 @@ def test_local_ms_pool_allocates_six_outlook_child_addresses_per_parent(tmp_path
     )
 
     accounts = [pool.get_email() for _ in range(6)]
+    assert pool._repository().stats()["used"] == 0
+    assert pool._repository().stats()["reserved"] == 6
 
     # Every use is an isolated random sub-address (parent+<6-char-tag>@outlook.com)
     # that delivers into the parent inbox.  The bare parent is never handed out:
@@ -90,6 +92,8 @@ def test_local_ms_pool_allocates_six_outlook_child_addresses_per_parent(tmp_path
         item.extra["provider_resource"]["metadata"]["parent_email"] == "parent@outlook.com"
         for item in accounts
     )
+    assert all(pool.commit_email(item) for item in accounts)
+    assert pool._repository().stats()["used"] == 6
 
     try:
         pool.get_email()
@@ -107,15 +111,32 @@ def test_local_ms_pool_defaults_to_six_children_and_excludes_exhausted_parent(tm
         state_file=str(tmp_path / "state.json"),
     )
 
-    emails = [pool.get_email().email for _ in range(6)]
+    accounts = [pool.get_email() for _ in range(6)]
+    emails = [account.email for account in accounts]
     # All six uses are isolated +tag sub-addresses; the bare parent is never used.
     assert all(re.fullmatch(r"parent\+[a-z0-9]{6}@outlook.com", email) for email in emails)
+    assert all(pool.commit_email(account) for account in accounts)
     try:
         pool.peek_email()
     except RuntimeError as exc:
         assert "已用尽" in str(exc)
     else:
         raise AssertionError("an exhausted Microsoft parent mailbox must leave the pool")
+
+
+def test_local_ms_pool_failure_releases_parent_capacity(tmp_path):
+    pool = LocalMicrosoftMailboxPool(
+        pool_text="parent@outlook.com----mail-pass----client-id----refresh-token",
+        state_file=str(tmp_path / "state.json"),
+    )
+
+    failed = pool.get_email()
+    assert failed.account_id.endswith("#sub-1")
+    assert pool.release_email(failed) is True
+
+    retried = pool.get_email()
+    assert retried.account_id.endswith("#sub-1")
+    assert retried.email != failed.email
 
 
 def test_child_mailbox_otp_filter_matches_only_the_assigned_recipient():

@@ -257,7 +257,29 @@ class MicrosoftMailboxModel(SQLModel, table=True):
     use_count: int = Field(default=0, index=True)
     max_uses: int = 6
     status: str = Field(default="available", index=True)
+    allocation_version: int = Field(default=1)
     last_reserved_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class MicrosoftMailboxLeaseModel(SQLModel, table=True):
+    __tablename__ = "microsoft_mailbox_leases"
+    __table_args__ = (
+        UniqueConstraint(
+            "mailbox_id",
+            "alias_index",
+            name="uq_microsoft_mailbox_leases_slot",
+        ),
+        UniqueConstraint("lease_token", name="uq_microsoft_mailbox_leases_token"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    mailbox_id: int = Field(index=True, foreign_key="microsoft_mailboxes.id")
+    alias_index: int = Field(index=True)
+    lease_token: str = Field(index=True)
+    status: str = Field(default="reserved", index=True)
+    expires_at: Optional[datetime] = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
@@ -569,6 +591,7 @@ def init_db():
 
     _migrate_legacy_accounts_schema()
     _ensure_column("provider_definitions", "category", "TEXT DEFAULT ''")
+    _ensure_column("microsoft_mailboxes", "allocation_version", "INTEGER DEFAULT 0")
     SQLModel.metadata.create_all(engine)
     _backfill_registered_email_history()
 
@@ -582,14 +605,23 @@ def init_db():
 
     from infrastructure.microsoft_mailbox_repository import (
         migrate_legacy_microsoft_mailbox_pool,
+        migrate_microsoft_mailbox_usage_leases,
     )
 
     mailbox_migration = migrate_legacy_microsoft_mailbox_pool()
+    usage_migration = migrate_microsoft_mailbox_usage_leases()
     if mailbox_migration.get("migrated"):
         print(
             "[DB] 已迁移微软邮箱池: "
             f"{mailbox_migration['migrated']} 个邮箱，"
             f"剩余 {mailbox_migration.get('remaining', 0)} 次"
+        )
+    if usage_migration.get("mailboxes"):
+        print(
+            "[DB] Microsoft mailbox usage reconciled: "
+            f"mailboxes={usage_migration['mailboxes']}, "
+            f"used={usage_migration.get('used', 0)}, "
+            f"reclaimed={usage_migration.get('reclaimed', 0)}"
         )
 
 

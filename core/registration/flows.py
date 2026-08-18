@@ -14,11 +14,33 @@ from .helpers import (
 from .models import RegistrationArtifacts, RegistrationContext, RegistrationResult
 
 
+def _finalize_mailbox_lease(ctx: RegistrationContext, *, success: bool) -> None:
+    mailbox_account = getattr(ctx.identity, "mailbox_account", None)
+    mailbox = getattr(ctx.platform, "mailbox", None)
+    if mailbox_account is None or mailbox is None:
+        return
+    method = getattr(mailbox, "commit_email" if success else "release_email", None)
+    if callable(method):
+        method(mailbox_account)
+
+
 class BrowserRegistrationFlow:
     def __init__(self, adapter: BrowserRegistrationAdapter):
         self.adapter = adapter
 
     def run(self, ctx: RegistrationContext) -> RegistrationResult:
+        try:
+            result = self._run(ctx)
+        except BaseException:
+            try:
+                _finalize_mailbox_lease(ctx, success=False)
+            except Exception:
+                pass
+            raise
+        _finalize_mailbox_lease(ctx, success=True)
+        return result
+
+    def _run(self, ctx: RegistrationContext) -> RegistrationResult:
         if self.adapter.preflight:
             self.adapter.preflight(ctx)
 
@@ -76,6 +98,18 @@ class ProtocolMailboxFlow:
         self.adapter = adapter
 
     def run(self, ctx: RegistrationContext) -> RegistrationResult:
+        try:
+            result = self._run(ctx)
+        except BaseException:
+            try:
+                _finalize_mailbox_lease(ctx, success=False)
+            except Exception:
+                pass
+            raise
+        _finalize_mailbox_lease(ctx, success=True)
+        return result
+
+    def _run(self, ctx: RegistrationContext) -> RegistrationResult:
         if self.adapter.preflight:
             self.adapter.preflight(ctx)
         if self.adapter.capability.protocol_mailbox_requires_email:
@@ -119,6 +153,18 @@ class ProtocolOAuthFlow:
         self.adapter = adapter
 
     def run(self, ctx: RegistrationContext) -> RegistrationResult:
+        try:
+            result = self._run(ctx)
+        except BaseException:
+            try:
+                _finalize_mailbox_lease(ctx, success=False)
+            except Exception:
+                pass
+            raise
+        _finalize_mailbox_lease(ctx, success=True)
+        return result
+
+    def _run(self, ctx: RegistrationContext) -> RegistrationResult:
         if self.adapter.preflight:
             self.adapter.preflight(ctx)
         ensure_oauth_executor_allowed(
