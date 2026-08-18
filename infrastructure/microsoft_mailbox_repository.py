@@ -633,13 +633,14 @@ def _parent_email_key(email: str) -> str:
 
 
 def migrate_microsoft_mailbox_usage_leases() -> dict:
-    """Convert eager legacy usage counts into committed-success leases.
+    """Reconcile committed usage leases from durable success history.
 
     Legacy versions incremented ``use_count`` before the browser was even
     started.  Rebuild those counts from durable successful-registration
-    history, then use leases for all future attempts.  Reserved leases are
-    process-local work, so any that survived a service restart are safe to
-    release here.
+    history, then use leases for all future attempts.  Reconciliation runs on
+    every service start so a crash between saving an account and committing
+    its lease is repaired in either direction.  Reserved leases are
+    process-local work, so any that survived a restart are safe to release.
     """
 
     now = _utcnow()
@@ -657,11 +658,7 @@ def migrate_microsoft_mailbox_usage_leases() -> dict:
             parent = _parent_email_key(email)
             if parent:
                 successful_by_parent[parent] += 1
-        mailboxes = session.exec(
-            select(MicrosoftMailboxModel).where(
-                MicrosoftMailboxModel.allocation_version < 1
-            )
-        ).all()
+        mailboxes = session.exec(select(MicrosoftMailboxModel)).all()
         reclaimed = 0
         confirmed_total = 0
         for mailbox in mailboxes:

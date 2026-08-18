@@ -1327,6 +1327,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         logger.set_subtask(f"worker_{index + 1}", f"Worker {index + 1}")
         lease = None
         worker_proxy = resolved_proxy
+        platform = None
         try:
             logger.log(f"开始注册第 {index + 1}/{count} 个账号")
             # Dynamic IP mode: draw a fresh rotating-residential IP for this worker.
@@ -1488,6 +1489,9 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 record_registered_email(account.platform, account.email)
                 if int(saved_account.id or 0) > 0:
                     registered_account_ids.append(int(saved_account.id))
+            identity_committer = getattr(platform, "commit_registration_identity", None)
+            if callable(identity_committer):
+                identity_committer()
             saved_account_id = int(saved_account.id)
             if resolved_proxy and registration_allocator is None:
                 proxy_pool.report_success(resolved_proxy)
@@ -1548,6 +1552,12 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             logger.log(f"注册失败: {error}", level="error")
             return error
         finally:
+            identity_releaser = getattr(platform, "release_registration_identity", None)
+            if callable(identity_releaser):
+                try:
+                    identity_releaser()
+                except Exception:
+                    pass
             if lease is not None:
                 lease.release()
             logger.clear_subtask()

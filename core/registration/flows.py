@@ -37,7 +37,6 @@ class BrowserRegistrationFlow:
             except Exception:
                 pass
             raise
-        _finalize_mailbox_lease(ctx, success=True)
         return result
 
     def _run(self, ctx: RegistrationContext) -> RegistrationResult:
@@ -106,7 +105,6 @@ class ProtocolMailboxFlow:
             except Exception:
                 pass
             raise
-        _finalize_mailbox_lease(ctx, success=True)
         return result
 
     def _run(self, ctx: RegistrationContext) -> RegistrationResult:
@@ -161,7 +159,6 @@ class ProtocolOAuthFlow:
             except Exception:
                 pass
             raise
-        _finalize_mailbox_lease(ctx, success=True)
         return result
 
     def _run(self, ctx: RegistrationContext) -> RegistrationResult:

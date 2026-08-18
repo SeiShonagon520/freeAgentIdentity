@@ -50,7 +50,7 @@ def _context(mailbox):
     )
 
 
-def test_protocol_flow_commits_mailbox_only_after_success():
+def test_protocol_flow_keeps_lease_until_outer_workflow_finishes():
     mailbox = TrackingMailbox()
     adapter = ProtocolMailboxAdapter(
         worker_builder=lambda _ctx, _artifacts: object(),
@@ -64,8 +64,10 @@ def test_protocol_flow_commits_mailbox_only_after_success():
     result = ProtocolMailboxFlow(adapter).run(_context(mailbox))
 
     assert result.email == mailbox.account.email
-    assert mailbox.committed == [mailbox.account.email]
+    assert mailbox.committed == []
     assert mailbox.released == []
+    assert mailbox.commit_email(mailbox.account) is True
+    assert mailbox.committed == [mailbox.account.email]
 
 
 def test_protocol_flow_releases_mailbox_on_registration_failure():
