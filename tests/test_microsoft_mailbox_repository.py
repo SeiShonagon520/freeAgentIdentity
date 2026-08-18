@@ -75,6 +75,16 @@ def test_repository_reservations_are_atomic_across_instances():
     }
 
 
+def test_concurrent_wave_spreads_across_parent_mailboxes_first():
+    repository = MicrosoftMailboxRepository()
+    repository.import_entries(parse_local_ms_pool_rows("\n".join(_row(i) for i in range(24))))
+
+    reservations = [repository.reserve() for _ in range(24)]
+
+    assert len({item.email for item in reservations}) == 24
+    assert {item.alias_index for item in reservations} == {1}
+
+
 def test_failed_registration_releases_slot_without_consuming_usage():
     repository = MicrosoftMailboxRepository()
     repository.import_entries(parse_local_ms_pool_rows(_row(1)))

@@ -252,7 +252,14 @@ class MicrosoftMailboxRepository:
                      AND lease.alias_index = alias_slots.alias_index
                     WHERE m.status != 'disabled'
                       AND lease.id IS NULL
-                    ORDER BY m.use_count, m.id, alias_slots.alias_index
+                    ORDER BY
+                        (
+                            SELECT COUNT(*)
+                            FROM microsoft_mailbox_leases AS occupied
+                            WHERE occupied.mailbox_id = m.id
+                        ),
+                        m.id,
+                        alias_slots.alias_index
                     LIMIT 1
                     """
                 )
@@ -402,6 +409,17 @@ class MicrosoftMailboxRepository:
 
     def peek(self) -> MicrosoftMailboxRecord:
         with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    DELETE FROM microsoft_mailbox_leases
+                    WHERE status = 'reserved'
+                      AND expires_at IS NOT NULL
+                      AND expires_at <= :now
+                    """
+                ),
+                {"now": _utcnow()},
+            )
             row = connection.execute(
                 text(
                     """
@@ -422,7 +440,14 @@ class MicrosoftMailboxRepository:
                      AND lease.alias_index = alias_slots.alias_index
                     WHERE m.status != 'disabled'
                       AND lease.id IS NULL
-                    ORDER BY m.use_count, m.id, alias_slots.alias_index
+                    ORDER BY
+                        (
+                            SELECT COUNT(*)
+                            FROM microsoft_mailbox_leases AS occupied
+                            WHERE occupied.mailbox_id = m.id
+                        ),
+                        m.id,
+                        alias_slots.alias_index
                     LIMIT 1
                     """
                 )
