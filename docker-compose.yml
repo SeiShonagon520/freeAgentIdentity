@@ -20,14 +20,18 @@ services:
       # 验证码收信走老机子 inbucket（新服务器不部署 inbucket）
       - CHATGPT_INBUCKET_API_URL=${CHATGPT_INBUCKET_API_URL:-}
       - APP_RUNTIME_MODE=${APP_RUNTIME_MODE:-server}
-      # 共享浏览器池：4 个进程 x 8 contexts = 32 并发。减少 Firefox 主进程
+      # 共享浏览器池：4 个进程 x 6 contexts = 24 并发。为 22 GiB 主机保留
       # 固定开销，同时保留多进程故障隔离。
       - BROWSER_POOL_SIZE=${BROWSER_POOL_SIZE:-4}
-      - BROWSER_POOL_MAX_CONTEXTS=${BROWSER_POOL_MAX_CONTEXTS:-8}
+      - BROWSER_POOL_MAX_CONTEXTS=${BROWSER_POOL_MAX_CONTEXTS:-6}
       # 错开页面启动，避免 30 个 Context 同一瞬间抢满 8 核 CPU。
       - BROWSER_CONTEXT_START_INTERVAL_MS=${BROWSER_CONTEXT_START_INTERVAL_MS:-175}
-      # 只限制最重的登录页加载阶段；后续 OTP/邮箱等待仍可保持 30 并发。
-      - BROWSER_POOL_STARTUP_CONCURRENCY=${BROWSER_POOL_STARTUP_CONCURRENCY:-16}
+      # 只限制最重的登录页加载阶段；后续 OTP/邮箱等待仍可保持 24 并发。
+      - BROWSER_POOL_STARTUP_CONCURRENCY=${BROWSER_POOL_STARTUP_CONCURRENCY:-8}
+      # 长任务定期替换 Camoufox，避免单个 Firefox 进程 RSS 持续累积。
+      - BROWSER_MAX_REGISTRATIONS_PER_PROCESS=${BROWSER_MAX_REGISTRATIONS_PER_PROCESS:-12}
+      - BROWSER_RECYCLE_DRAIN_TIMEOUT_SECONDS=${BROWSER_RECYCLE_DRAIN_TIMEOUT_SECONDS:-20}
+      - BROWSER_LAUNCH_ATTEMPTS=${BROWSER_LAUNCH_ATTEMPTS:-3}
       - CHATGPT_BROWSER_BLOCK_IMAGES=${CHATGPT_BROWSER_BLOCK_IMAGES:-1}
       - CHATGPT_BROWSER_DIAGNOSTICS_DIR=/app/data/browser-diagnostics
       - MIHOMO_CONTROLLER_URL=http://mihomo:9090
@@ -68,6 +72,11 @@ services:
       - default
       - inbucket
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   mihomo:
     image: metacubex/mihomo:latest
@@ -78,6 +87,11 @@ services:
       - ${MIHOMO_CONFIG_PATH:-./deploy/mihomo/config.yaml}:/root/.config/mihomo/config.yaml
       - mihomo-provider-data:/root/.config/mihomo/providers
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
 volumes:
   mihomo-provider-data:

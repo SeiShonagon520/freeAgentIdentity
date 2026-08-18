@@ -58,6 +58,18 @@ _NO_EMAIL_MARKER = "__no_email__"
 # be created.  Both controllers terminate the task instead of spinning out
 # thousands of pool-exhaustion failures.
 _POOL_EXHAUSTED_MARKER = "__pool_exhausted__"
+_BROWSER_INFRA_FAILURE_MARKERS = (
+    "共享浏览器进程已退出",
+    "共享浏览器进程在注册过程中退出",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "browser disconnected",
+    "target closed",
+)
+_BROWSER_FATAL_FAILURE_MARKERS = (
+    "共享浏览器事件循环超过",
+    "共享浏览器池无可用进程",
+)
 # The executor keeps only ``concurrency`` futures in flight, so this remains
 # bounded even when a task checks tens of thousands of accounts.
 MAX_REFRESH_TOKEN_CHECK_CONCURRENCY = 200
@@ -72,6 +84,16 @@ CONFIRMED_CHATGPT_BAN_CODES = {
     "account_suspended",
     "account_banned",
 }
+
+
+def _is_browser_infrastructure_failure(value: Any) -> bool:
+    message = str(value or "").strip().lower()
+    return any(marker.lower() in message for marker in _BROWSER_INFRA_FAILURE_MARKERS)
+
+
+def _is_browser_runtime_fatal_failure(value: Any) -> bool:
+    message = str(value or "").strip().lower()
+    return any(marker.lower() in message for marker in _BROWSER_FATAL_FAILURE_MARKERS)
 
 TERMINAL_TASK_STATUSES = {
     TASK_STATUS_SUCCEEDED,
@@ -979,6 +1001,8 @@ def _run_unlimited_registration(
     completed = 0
     next_index = 0
     fatal_error = ""
+    browser_infra_failures_since_success = 0
+    browser_infra_failure_limit = max(int(concurrency) * 2, 8)
     registered_accounts: list[dict[str, Any]] = []
 
     try:
@@ -995,6 +1019,7 @@ def _run_unlimited_registration(
                     completed += 1
                     if isinstance(result, dict):
                         success += 1
+                        browser_infra_failures_since_success = 0
                         if len(registered_accounts) < MAX_TASK_ACCOUNT_SUMMARIES:
                             registered_accounts.append(result)
                     elif result == _POOL_EXHAUSTED_MARKER:
@@ -1005,6 +1030,19 @@ def _run_unlimited_registration(
                     elif result != "__cancel_requested__":
                         failure_count += 1
                         first_error = first_error or str(result)
+                        if _is_browser_runtime_fatal_failure(result):
+                            fatal_error = f"共享浏览器池失去响应，任务终止: {result}"
+                        elif _is_browser_infrastructure_failure(result):
+                            browser_infra_failures_since_success += 1
+                            if (
+                                browser_infra_failures_since_success
+                                >= browser_infra_failure_limit
+                            ):
+                                fatal_error = (
+                                    "共享浏览器连续崩溃，已触发熔断，任务终止："
+                                    f"连续 {browser_infra_failures_since_success} 次失败"
+                                )
+                                logger.log(fatal_error, level="error")
                     logger.set_progress(completed, 0)
                     if (
                         not logger.is_cancel_requested()

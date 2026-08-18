@@ -58,6 +58,27 @@ class BrowserProxyBlockedError(RuntimeError):
     """The current proxy route cannot reach a usable ChatGPT registration page."""
 
 
+class BrowserProcessCrashedError(RuntimeError):
+    """The shared Camoufox process disappeared while a worker was using it."""
+
+
+_BROWSER_PROCESS_LOST_MARKERS = (
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "browser closed",
+    "browser disconnected",
+    "target closed",
+    "connection closed while reading from the driver",
+    "playwright connection closed",
+)
+
+
+def is_browser_process_lost_error(exc: BaseException | str) -> bool:
+    """Return whether a Playwright error means the browser process is gone."""
+    message = str(exc or "").strip().lower()
+    return any(marker in message for marker in _BROWSER_PROCESS_LOST_MARKERS)
+
+
 _HARD_PROXY_BLOCK_MARKERS = (
     "unable to load site",
     "if you are using a vpn",
@@ -975,22 +996,46 @@ async def register_in_context(browser, *, email: str, password: str, proxy: str 
                               otp_callback: Callable[[], str], log,
                               startup_gate: asyncio.Semaphore | None = None,
                               bind_totp_2fa: bool = False,
-                              close_timeout_seconds: float = 15.0) -> dict:
+                              close_timeout_seconds: float = 15.0,
+                              health_state: dict[str, Any] | None = None) -> dict:
     """在共享浏览器进程里开一个独立指纹 context，跑完注册并关闭 context。"""
-    context = await AsyncNewContext(
-        browser,
-        os=random.choice(_CONTEXT_OS_CHOICES),
-        proxy=_build_proxy_config(proxy),
-        # A smaller desktop viewport lowers paint/compositing cost by roughly
-        # 28% while keeping the current registration form in desktop layout.
-        viewport={"width": 1024, "height": 720},
-        locale="en-US",
-        timezone_id="America/New_York",
-        reduced_motion="reduce",
-        service_workers="block",
-    )
+    health = health_state if health_state is not None else {}
     try:
-        page = await context.new_page()
+        context = await AsyncNewContext(
+            browser,
+            os=random.choice(_CONTEXT_OS_CHOICES),
+            proxy=_build_proxy_config(proxy),
+            # A smaller desktop viewport lowers paint/compositing cost by roughly
+            # 28% while keeping the current registration form in desktop layout.
+            viewport={"width": 1024, "height": 720},
+            locale="en-US",
+            timezone_id="America/New_York",
+            reduced_motion="reduce",
+            service_workers="block",
+        )
+    except Exception as exc:
+        if is_browser_process_lost_error(exc):
+            health["recycle_required"] = True
+            health["context_started"] = False
+            health["reason"] = str(exc)[:300]
+            raise BrowserProcessCrashedError(
+                f"共享浏览器进程已退出，无法创建 context: {exc}"
+            ) from exc
+        raise
+    health["context_started"] = True
+    try:
+        try:
+            page = await context.new_page()
+        except Exception as exc:
+            if is_browser_process_lost_error(exc):
+                health["recycle_required"] = True
+                health["page_started"] = False
+                health["reason"] = str(exc)[:300]
+                raise BrowserProcessCrashedError(
+                    f"共享浏览器进程已退出，无法创建页面: {exc}"
+                ) from exc
+            raise
+        health["page_started"] = True
         try:
             final = await _browser_registration_flow(
                 page,
@@ -1010,7 +1055,14 @@ async def register_in_context(browser, *, email: str, password: str, proxy: str 
             })
             return result
         except Exception as exc:
+            if is_browser_process_lost_error(exc):
+                health["recycle_required"] = True
+                health["reason"] = str(exc)[:300]
             await _capture_failure(page, reason=str(exc), log=log)
+            if is_browser_process_lost_error(exc):
+                raise BrowserProcessCrashedError(
+                    f"共享浏览器进程在注册过程中退出: {exc}"
+                ) from exc
             raise
     finally:
         close_task = None
@@ -1022,16 +1074,28 @@ async def register_in_context(browser, *, email: str, password: str, proxy: str 
             )
             if not done:
                 close_task.cancel()
+                health["recycle_required"] = True
+                health["reason"] = "browser context close timeout"
                 log(
-                    "浏览器 context 关闭超时，已放弃等待关闭响应",
+                    "浏览器 context 关闭超时，将回收对应 Camoufox 进程",
                     level="warning",
                 )
             else:
                 close_task.result()
-        except Exception:
+        except Exception as exc:
             if close_task is not None and not close_task.done():
                 close_task.cancel()
-            pass
+            health["recycle_required"] = True
+            health["reason"] = str(exc)[:300] or "browser context close failed"
+            log(
+                f"浏览器 context 关闭失败，将回收对应 Camoufox 进程: {exc}",
+                level="warning",
+            )
 
 
-__all__ = ["BrowserProxyBlockedError", "register_in_context"]
+__all__ = [
+    "BrowserProcessCrashedError",
+    "BrowserProxyBlockedError",
+    "is_browser_process_lost_error",
+    "register_in_context",
+]

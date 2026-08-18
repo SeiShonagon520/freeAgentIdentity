@@ -491,6 +491,33 @@ def test_pulse_stops_when_the_shared_browser_event_loop_is_unresponsive():
     assert logger.result_data["success"] == 0
 
 
+def test_pulse_retries_then_trips_circuit_breaker_on_mass_browser_crashes():
+    allocator = _FakeAllocator(nodes=("Node A",), slot_count=1)
+    registrar = _FakeRegistrar(
+        wave_fn=lambda index, node: (
+            "共享浏览器进程已退出，无法创建 context: "
+            "Target page, context or browser has been closed"
+        )
+    )
+    logger = _FakeLogger()
+    controller = PulseRegistration(
+        do_one=registrar,
+        allocator=allocator,
+        config=PulseConfig(wave_concurrency=1),
+        logger=logger,
+        count=1,
+    )
+    controller._stop.wait = lambda _timeout=None: False
+
+    controller.run()
+
+    assert logger.finished[0] == TASK_STATUS_FAILED
+    assert "连续两个波次大面积崩溃" in logger.finished[1]
+    assert len(registrar.wave_calls()) == 2
+    assert logger.result_data["fail"] == 2
+    assert logger.result_data["success"] == 0
+
+
 def test_pulse_pool_exhausted_stops_the_task():
     allocator = _FakeAllocator(nodes=("Node A", "Node B"))
     registrar = _FakeRegistrar(wave_fn=lambda index, node: _POOL_EXHAUSTED_MARKER)
@@ -518,6 +545,24 @@ def test_unlimited_registration_stops_on_pool_exhaustion():
     assert logger.finished == (TASK_STATUS_FAILED, "本地微软邮箱池已用尽，注册任务终止")
     # Only the initial 4 workers ran; nothing further was submitted.
     assert calls["n"] == 4
+
+
+def test_unlimited_registration_stops_browser_crash_failure_storm():
+    calls = {"n": 0}
+
+    def do_one(index):
+        calls["n"] += 1
+        return (
+            "共享浏览器进程已退出，无法创建 context: "
+            "Target page, context or browser has been closed"
+        )
+
+    logger = _FakeLogger()
+    tasks_module._run_unlimited_registration(do_one, concurrency=1, logger=logger)
+
+    assert logger.finished[0] == TASK_STATUS_FAILED
+    assert "连续崩溃" in logger.finished[1]
+    assert calls["n"] == 8
 
 
 def test_probe_forces_banned_node_and_short_otp_timeout():

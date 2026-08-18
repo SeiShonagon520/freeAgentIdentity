@@ -182,6 +182,145 @@ def test_browser_pool_preserves_a_real_otp_timeout(monkeypatch):
     )
 
 
+def test_browser_pool_rebuilds_when_context_start_finds_a_dead_browser(monkeypatch):
+    _FakeAsyncManager.instances.clear()
+    monkeypatch.setattr(browser_pool, "AsyncCamoufox", _FakeAsyncManager)
+    calls = []
+    logs = []
+
+    async def fake_register(_browser, **kwargs):
+        calls.append(kwargs["email"])
+        if len(calls) == 1:
+            kwargs["health_state"].update(
+                {
+                    "recycle_required": True,
+                    "context_started": False,
+                    "reason": "Target page, context or browser has been closed",
+                }
+            )
+            raise browser_pool.BrowserProcessCrashedError("browser has been closed")
+        return {"email": kwargs["email"]}
+
+    monkeypatch.setattr(browser_pool, "register_in_context", fake_register)
+    pool = browser_pool.BrowserProcessPool(
+        headless=True,
+        pool_size=1,
+        max_contexts_per_browser=1,
+        browser_recycle_timeout_seconds=0.2,
+    )
+    try:
+        result = pool.register(
+            email="recovered@example.com",
+            password="password",
+            proxy=None,
+            otp_callback=lambda: "123456",
+            log_fn=lambda message, **kwargs: logs.append((message, kwargs)),
+        )
+    finally:
+        pool.shutdown()
+
+    assert result == {"email": "recovered@example.com"}
+    assert calls == ["recovered@example.com", "recovered@example.com"]
+    assert len(_FakeAsyncManager.instances) == 2
+    assert all(manager.exited == 1 for manager in _FakeAsyncManager.instances)
+    assert any("安全重试一次" in message for message, _ in logs)
+
+
+def test_browser_pool_recycles_after_context_cleanup_failure(monkeypatch):
+    _FakeAsyncManager.instances.clear()
+    monkeypatch.setattr(browser_pool, "AsyncCamoufox", _FakeAsyncManager)
+
+    async def fake_register(_browser, **kwargs):
+        kwargs["health_state"].update(
+            {
+                "recycle_required": True,
+                "context_started": True,
+                "reason": "browser context close timeout",
+            }
+        )
+        return {"email": kwargs["email"]}
+
+    monkeypatch.setattr(browser_pool, "register_in_context", fake_register)
+    pool = browser_pool.BrowserProcessPool(
+        headless=True,
+        pool_size=1,
+        max_contexts_per_browser=1,
+        browser_recycle_timeout_seconds=0.2,
+    )
+    try:
+        result = pool.register(
+            email="cleanup@example.com",
+            password="password",
+            proxy=None,
+            otp_callback=lambda: "123456",
+            log_fn=lambda *_args, **_kwargs: None,
+        )
+    finally:
+        pool.shutdown()
+
+    assert result == {"email": "cleanup@example.com"}
+    assert len(_FakeAsyncManager.instances) == 2
+    assert all(manager.exited == 1 for manager in _FakeAsyncManager.instances)
+
+
+def test_browser_pool_periodically_recycles_long_running_processes(monkeypatch):
+    _FakeAsyncManager.instances.clear()
+    monkeypatch.setattr(browser_pool, "AsyncCamoufox", _FakeAsyncManager)
+
+    async def fake_register(_browser, **kwargs):
+        return {"email": kwargs["email"]}
+
+    monkeypatch.setattr(browser_pool, "register_in_context", fake_register)
+    pool = browser_pool.BrowserProcessPool(
+        headless=True,
+        pool_size=1,
+        max_contexts_per_browser=1,
+        max_registrations_per_browser=1,
+        browser_recycle_timeout_seconds=0.2,
+    )
+    try:
+        assert pool.register(
+            email="rotate@example.com",
+            password="password",
+            proxy=None,
+            otp_callback=lambda: "123456",
+            log_fn=lambda *_args, **_kwargs: None,
+        ) == {"email": "rotate@example.com"}
+        deadline = time.monotonic() + 1
+        while len(_FakeAsyncManager.instances) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        pool.shutdown()
+
+    assert len(_FakeAsyncManager.instances) == 2
+    assert all(manager.exited == 1 for manager in _FakeAsyncManager.instances)
+
+
+def test_context_start_classifies_a_dead_browser_for_pool_recovery(monkeypatch):
+    health = {}
+
+    async def dead_new_context(_browser, **_kwargs):
+        raise RuntimeError("Target page, context or browser has been closed")
+
+    monkeypatch.setattr(browser_register_async, "AsyncNewContext", dead_new_context)
+
+    with pytest.raises(browser_register_async.BrowserProcessCrashedError):
+        asyncio.run(
+            browser_register_async.register_in_context(
+                object(),
+                email="dead@example.com",
+                password="password",
+                proxy=None,
+                otp_callback=lambda: "123456",
+                log=lambda *_args, **_kwargs: None,
+                health_state=health,
+            )
+        )
+
+    assert health["recycle_required"] is True
+    assert health["context_started"] is False
+
+
 def test_async_registration_context_uses_lightweight_headless_options(monkeypatch):
     captured = {}
 
@@ -298,6 +437,7 @@ def test_async_browser_totp_binding_uses_authenticated_page_fetch(monkeypatch):
 
 def test_async_registration_context_close_has_a_hard_timeout(monkeypatch):
     logs = []
+    health = {}
 
     class Context:
         async def new_page(self):
@@ -325,12 +465,15 @@ def test_async_registration_context_close_has_a_hard_timeout(monkeypatch):
             otp_callback=lambda: "123456",
             log=lambda message, **kwargs: logs.append((message, kwargs)),
             close_timeout_seconds=0.01,
+            health_state=health,
         )
     )
 
     assert result["access_token"] == "token"
     assert time.monotonic() - started_at < 1
     assert any("context 关闭超时" in message for message, _ in logs)
+    assert health["recycle_required"] is True
+    assert health["reason"] == "browser context close timeout"
 
 
 def test_browser_fetch_session_exits_the_camoufox_manager(monkeypatch):

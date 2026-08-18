@@ -39,7 +39,12 @@ from typing import Any, Callable
 
 from camoufox.async_api import AsyncCamoufox
 
-from .browser_register_async import BrowserProxyBlockedError, register_in_context
+from .browser_register_async import (
+    BrowserProcessCrashedError,
+    BrowserProxyBlockedError,
+    is_browser_process_lost_error,
+    register_in_context,
+)
 
 
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
@@ -56,14 +61,14 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 _DEFAULT_POOL_SIZE = _env_int("BROWSER_POOL_SIZE", 4, minimum=1)
-_DEFAULT_MAX_CONTEXTS = _env_int("BROWSER_POOL_MAX_CONTEXTS", 8, minimum=1)
+_DEFAULT_MAX_CONTEXTS = _env_int("BROWSER_POOL_MAX_CONTEXTS", 6, minimum=1)
 _DEFAULT_CONTEXT_START_INTERVAL_MS = _env_int(
     "BROWSER_CONTEXT_START_INTERVAL_MS",
     175,
 )
 _DEFAULT_STARTUP_CONCURRENCY = _env_int(
     "BROWSER_POOL_STARTUP_CONCURRENCY",
-    16,
+    8,
     minimum=1,
 )
 _DEFAULT_BLOCK_IMAGES = _env_bool("CHATGPT_BROWSER_BLOCK_IMAGES", True)
@@ -81,6 +86,21 @@ _DEFAULT_BROWSER_RECYCLE_TIMEOUT_SECONDS = _env_int(
     "BROWSER_RECYCLE_TIMEOUT_SECONDS",
     45,
     minimum=5,
+)
+_DEFAULT_BROWSER_RECYCLE_DRAIN_TIMEOUT_SECONDS = _env_int(
+    "BROWSER_RECYCLE_DRAIN_TIMEOUT_SECONDS",
+    20,
+    minimum=1,
+)
+_DEFAULT_BROWSER_MAX_REGISTRATIONS = _env_int(
+    "BROWSER_MAX_REGISTRATIONS_PER_PROCESS",
+    12,
+    minimum=1,
+)
+_DEFAULT_BROWSER_LAUNCH_ATTEMPTS = _env_int(
+    "BROWSER_LAUNCH_ATTEMPTS",
+    3,
+    minimum=1,
 )
 
 _locks: dict[str, threading.Lock] = {}
@@ -101,7 +121,11 @@ class _BrowserSlot:
     browser: Any
     semaphore: asyncio.Semaphore
     recycle_lock: asyncio.Lock
+    idle_event: asyncio.Event
     generation: int = 0
+    active_contexts: int = 0
+    completed_contexts: int = 0
+    draining: bool = False
 
 
 class BrowserProcessPool:
@@ -119,6 +143,9 @@ class BrowserProcessPool:
         registration_timeout_seconds: float = _DEFAULT_REGISTER_TIMEOUT_SECONDS,
         context_close_timeout_seconds: float = _DEFAULT_CONTEXT_CLOSE_TIMEOUT_SECONDS,
         browser_recycle_timeout_seconds: float = _DEFAULT_BROWSER_RECYCLE_TIMEOUT_SECONDS,
+        browser_recycle_drain_timeout_seconds: float = _DEFAULT_BROWSER_RECYCLE_DRAIN_TIMEOUT_SECONDS,
+        max_registrations_per_browser: int = _DEFAULT_BROWSER_MAX_REGISTRATIONS,
+        browser_launch_attempts: int = _DEFAULT_BROWSER_LAUNCH_ATTEMPTS,
     ):
         self.headless = headless
         self.pool_size = max(int(pool_size or 1), 1)
@@ -133,6 +160,15 @@ class BrowserProcessPool:
         self.registration_timeout = max(float(registration_timeout_seconds or 0), 0.1)
         self.context_close_timeout = max(float(context_close_timeout_seconds or 0), 0.1)
         self.browser_recycle_timeout = max(float(browser_recycle_timeout_seconds or 0), 0.1)
+        self.browser_recycle_drain_timeout = max(
+            float(browser_recycle_drain_timeout_seconds or 0),
+            0.1,
+        )
+        self.max_registrations_per_browser = max(
+            int(max_registrations_per_browser or 1),
+            1,
+        )
+        self.browser_launch_attempts = max(int(browser_launch_attempts or 1), 1)
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -216,12 +252,15 @@ class BrowserProcessPool:
         self._context_start_lock = asyncio.Lock()
         for _ in range(self.pool_size):
             manager, browser = await self._launch_browser()
+            idle_event = asyncio.Event()
+            idle_event.set()
             self._browsers.append(
                 _BrowserSlot(
                     manager=manager,
                     browser=browser,
                     semaphore=asyncio.Semaphore(self.max_contexts),
                     recycle_lock=asyncio.Lock(),
+                    idle_event=idle_event,
                 )
             )
 
@@ -273,28 +312,73 @@ class BrowserProcessPool:
         *,
         expected_generation: int,
         log_fn: Callable[..., None],
+        reason: str = "",
+        force_after_drain_timeout: bool = True,
     ) -> None:
         async with slot.recycle_lock:
             if slot.generation != expected_generation:
                 return
+            slot.draining = True
+            if slot.active_contexts > 0:
+                if force_after_drain_timeout:
+                    try:
+                        await asyncio.wait_for(
+                            slot.idle_event.wait(),
+                            timeout=self.browser_recycle_drain_timeout,
+                        )
+                    except TimeoutError:
+                        log_fn(
+                            "共享浏览器等待活动 context 退出超时，正在强制回收进程",
+                            level="warning",
+                        )
+                else:
+                    await slot.idle_event.wait()
             old_manager, old_browser = slot.manager, slot.browser
             slot.manager = None
             slot.browser = None
             slot.generation += 1
+            slot.completed_contexts = 0
             await self._close_browser(old_manager, old_browser)
             if self._closed:
                 return
-            try:
-                manager, browser = await asyncio.wait_for(
-                    self._launch_browser(),
-                    timeout=self.browser_recycle_timeout,
-                )
-            except Exception as exc:
-                log_fn(f"共享浏览器进程重建失败: {exc}", level="error")
+            last_error: Exception | None = None
+            for attempt in range(1, self.browser_launch_attempts + 1):
+                try:
+                    manager, browser = await asyncio.wait_for(
+                        self._launch_browser(),
+                        timeout=self.browser_recycle_timeout,
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    log_fn(
+                        "共享浏览器进程重建失败 "
+                        f"({attempt}/{self.browser_launch_attempts}): {exc}",
+                        level="error",
+                    )
+                    if attempt < self.browser_launch_attempts:
+                        await asyncio.sleep(min(2 ** (attempt - 1), 5))
+                    continue
+                slot.manager = manager
+                slot.browser = browser
+                slot.draining = False
+                suffix = f"，原因: {reason}" if reason else ""
+                log_fn(f"共享浏览器进程已重建{suffix}", level="warning")
                 return
-            slot.manager = manager
-            slot.browser = browser
-            log_fn("卡死的共享浏览器进程已重建", level="warning")
+            slot.draining = True
+            log_fn(
+                f"共享浏览器进程连续重建失败，slot 已停用: {last_error}",
+                level="error",
+            )
+
+    @staticmethod
+    def _browser_is_connected(browser: Any) -> bool:
+        if browser is None:
+            return False
+        try:
+            checker = getattr(browser, "is_connected", None)
+            return bool(checker()) if callable(checker) else True
+        except Exception:
+            return False
 
     async def _async_shutdown(self) -> None:
         browsers, self._browsers = self._browsers, []
@@ -303,6 +387,7 @@ class BrowserProcessPool:
                 manager, browser = slot.manager, slot.browser
                 slot.manager = None
                 slot.browser = None
+                slot.draining = True
                 slot.generation += 1
                 await self._close_browser(manager, browser)
         self._browsers.clear()
@@ -439,66 +524,227 @@ class BrowserProcessPool:
         state: dict[str, Any],
     ) -> dict:
         async with self._global_sem:
-            # 轮询找一个有剩余 context 配额的浏览器
+            # A context that never started is safe to retry after rebuilding
+            # its browser.  Once the page existed, propagate the failure to the
+            # task because the remote signup may already have changed state.
+            safe_restart_attempts = 0
+            pool_recovery_attempted = False
             while True:
-                if self._browsers and not any(
-                    slot.browser is not None for slot in self._browsers
-                ):
-                    raise RuntimeError("共享浏览器池无可用进程，需要重启任务后重建")
+                available = [
+                    slot
+                    for slot in self._browsers
+                    if slot.browser is not None
+                    and not slot.draining
+                    and self._browser_is_connected(slot.browser)
+                ]
+                if self._browsers and not available:
+                    if pool_recovery_attempted:
+                        raise RuntimeError("共享浏览器池无可用进程，自动重建失败")
+                    pool_recovery_attempted = True
+                    recoverable = next(
+                        (
+                            slot
+                            for slot in self._browsers
+                            if not slot.recycle_lock.locked()
+                        ),
+                        None,
+                    )
+                    if recoverable is None:
+                        await asyncio.sleep(0.2)
+                        continue
+                    recoverable.draining = True
+                    await self._recycle_browser_slot(
+                        recoverable,
+                        expected_generation=recoverable.generation,
+                        log_fn=log_fn,
+                        reason="浏览器池没有可用进程",
+                    )
+                    continue
+
+                recycled_disconnected = False
                 for slot in self._browsers:
-                    if slot.browser is not None and not slot.semaphore.locked():
-                        async with slot.semaphore:
-                            browser = slot.browser
-                            if browser is None:
-                                continue
-                            state["slot"] = slot
-                            state["generation"] = slot.generation
-                            attempts = max(int(max_proxy_attempts or 1), 1)
-                            current_proxy = proxy
-                            for attempt in range(1, attempts + 1):
-                                try:
-                                    await self._wait_for_context_start_slot()
-                                    return await register_in_context(
-                                        browser,
-                                        email=email,
-                                        password=password,
-                                        proxy=current_proxy,
-                                        otp_callback=otp_callback,
-                                        bind_totp_2fa=bind_totp_2fa,
-                                        log=log_fn,
-                                        startup_gate=self._startup_sem,
-                                        close_timeout_seconds=self.context_close_timeout,
+                    browser = slot.browser
+                    if slot.draining or browser is None:
+                        continue
+                    if not self._browser_is_connected(browser):
+                        slot.draining = True
+                        await self._recycle_browser_slot(
+                            slot,
+                            expected_generation=slot.generation,
+                            log_fn=log_fn,
+                            reason="Playwright 检测到浏览器已断开",
+                        )
+                        recycled_disconnected = True
+                        break
+                    if slot.semaphore.locked():
+                        continue
+
+                    await slot.semaphore.acquire()
+                    browser = slot.browser
+                    if (
+                        slot.draining
+                        or browser is None
+                        or not self._browser_is_connected(browser)
+                    ):
+                        slot.semaphore.release()
+                        continue
+
+                    generation = slot.generation
+                    slot.active_contexts += 1
+                    slot.idle_event.clear()
+                    state["slot"] = slot
+                    state["generation"] = generation
+                    recycle_reason = ""
+                    recycle_force = True
+                    safe_to_retry = False
+                    result: dict[str, Any] | None = None
+                    pending_error: BaseException | None = None
+                    try:
+                        attempts = max(int(max_proxy_attempts or 1), 1)
+                        current_proxy = proxy
+                        for attempt in range(1, attempts + 1):
+                            health: dict[str, Any] = {}
+                            try:
+                                await self._wait_for_context_start_slot()
+                                result = await register_in_context(
+                                    browser,
+                                    email=email,
+                                    password=password,
+                                    proxy=current_proxy,
+                                    otp_callback=otp_callback,
+                                    bind_totp_2fa=bind_totp_2fa,
+                                    log=log_fn,
+                                    startup_gate=self._startup_sem,
+                                    close_timeout_seconds=self.context_close_timeout,
+                                    health_state=health,
+                                )
+                            except BrowserProxyBlockedError as exc:
+                                if health.get("recycle_required"):
+                                    recycle_reason = str(
+                                        health.get("reason") or exc
+                                    )[:300]
+                                    pending_error = BrowserProcessCrashedError(
+                                        "共享浏览器 context 无法可靠回收"
                                     )
-                                except BrowserProxyBlockedError as exc:
-                                    if not callable(proxy_rotate_callback):
-                                        raise
-                                    if attempt >= attempts:
-                                        # Feed the final bad route back to the
-                                        # task-wide allocator too, so another
-                                        # worker cannot immediately reuse it.
-                                        try:
-                                            await asyncio.to_thread(
-                                                proxy_rotate_callback
-                                            )
-                                        except Exception:
-                                            pass
-                                        raise
-                                    log_fn(
-                                        f"代理线路被 ChatGPT 拒绝或不可用 "
-                                        f"({attempt}/{attempts}): {exc}；正在换节点重试",
-                                        level="warning",
+                                    safe_to_retry = not bool(
+                                        health.get(
+                                            "page_started",
+                                            health.get("context_started", True),
+                                        )
                                     )
+                                    break
+                                if not callable(proxy_rotate_callback):
+                                    pending_error = exc
+                                    break
+                                if attempt >= attempts:
+                                    # Feed the final bad route back to the
+                                    # task-wide allocator too, so another
+                                    # worker cannot immediately reuse it.
                                     try:
-                                        rotated = await asyncio.to_thread(
+                                        await asyncio.to_thread(
                                             proxy_rotate_callback
                                         )
-                                    except Exception as rotate_exc:
-                                        raise BrowserProxyBlockedError(
-                                            f"{exc}；代理轮换失败: {rotate_exc}"
-                                        ) from rotate_exc
-                                    current_proxy = str(rotated or current_proxy or "").strip() or None
-                                    await asyncio.sleep(1.0)
-                            raise RuntimeError("浏览器代理重试状态异常")
+                                    except Exception:
+                                        pass
+                                    pending_error = exc
+                                    break
+                                log_fn(
+                                    f"代理线路被 ChatGPT 拒绝或不可用 "
+                                    f"({attempt}/{attempts}): {exc}；正在换节点重试",
+                                    level="warning",
+                                )
+                                try:
+                                    rotated = await asyncio.to_thread(
+                                        proxy_rotate_callback
+                                    )
+                                except Exception as rotate_exc:
+                                    pending_error = BrowserProxyBlockedError(
+                                        f"{exc}；代理轮换失败: {rotate_exc}"
+                                    )
+                                    break
+                                current_proxy = str(
+                                    rotated or current_proxy or ""
+                                ).strip() or None
+                                await asyncio.sleep(1.0)
+                                continue
+                            except Exception as exc:
+                                if (
+                                    health.get("recycle_required")
+                                    or isinstance(exc, BrowserProcessCrashedError)
+                                    or is_browser_process_lost_error(exc)
+                                ):
+                                    recycle_reason = str(
+                                        health.get("reason") or exc
+                                    )[:300]
+                                    safe_to_retry = not bool(
+                                        health.get(
+                                            "page_started",
+                                            health.get("context_started", True),
+                                        )
+                                    )
+                                    if not isinstance(exc, BrowserProcessCrashedError):
+                                        exc = BrowserProcessCrashedError(
+                                            f"共享浏览器进程已退出: {exc}"
+                                        )
+                                pending_error = exc
+                                break
+                            else:
+                                if health.get("recycle_required"):
+                                    recycle_reason = str(
+                                        health.get("reason")
+                                        or "context 清理失败"
+                                    )[:300]
+                                break
+                        if result is None and pending_error is None:
+                            pending_error = RuntimeError("浏览器代理重试状态异常")
+                    finally:
+                        if slot.generation == generation:
+                            slot.completed_contexts += 1
+                        if (
+                            not recycle_reason
+                            and not slot.draining
+                            and slot.generation == generation
+                            and slot.completed_contexts
+                            >= self.max_registrations_per_browser
+                        ):
+                            recycle_reason = (
+                                "达到单进程注册轮换上限 "
+                                f"{self.max_registrations_per_browser}"
+                            )
+                            recycle_force = False
+                        if recycle_reason and slot.generation == generation:
+                            slot.draining = True
+                        slot.active_contexts = max(slot.active_contexts - 1, 0)
+                        if slot.active_contexts == 0:
+                            slot.idle_event.set()
+                        slot.semaphore.release()
+
+                    if recycle_reason:
+                        recycle_coro = self._recycle_browser_slot(
+                            slot,
+                            expected_generation=generation,
+                            log_fn=log_fn,
+                            reason=recycle_reason,
+                            force_after_drain_timeout=recycle_force,
+                        )
+                        if recycle_force:
+                            await recycle_coro
+                        else:
+                            asyncio.create_task(recycle_coro)
+                    if pending_error is not None:
+                        if safe_to_retry and safe_restart_attempts < 1:
+                            safe_restart_attempts += 1
+                            log_fn(
+                                "浏览器在创建 context 前退出，已重建并安全重试一次",
+                                level="warning",
+                            )
+                            break
+                        raise pending_error
+                    if result is not None:
+                        return result
+                    raise RuntimeError("浏览器注册未返回结果")
+                if recycled_disconnected:
+                    continue
                 await asyncio.sleep(0.2)
 
     # ------------------------------------------------------------ lifecycle

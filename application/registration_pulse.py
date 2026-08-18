@@ -41,6 +41,8 @@ from application.tasks import (
     TASK_STATUS_SUCCEEDED,
     _NO_EMAIL_MARKER,
     _POOL_EXHAUSTED_MARKER,
+    _is_browser_infrastructure_failure,
+    _is_browser_runtime_fatal_failure,
 )
 from core.mihomo_client import MihomoNodeError
 
@@ -158,6 +160,7 @@ class PulseRegistration:
         # Set when a worker reports the mailbox pool is exhausted; the task then
         # stops scheduling new waves and finishes with this error.
         self._fatal_error = ""
+        self._browser_infra_bad_waves = 0
         # Probe coordination.
         self._stop = threading.Event()
         self._probe_tick = threading.Event()      # immediate probe request
@@ -226,6 +229,7 @@ class PulseRegistration:
                 }
                 no_email_by_node: dict[str, list[int]] = {}
                 node_had_success: set[str] = set()
+                browser_infra_errors: list[str] = []
                 timed_out = False
                 try:
                     for future in as_completed(
@@ -237,6 +241,7 @@ class PulseRegistration:
                             futures[future],
                             no_email_by_node,
                             node_had_success,
+                            browser_infra_errors,
                         )
                         self._logger.set_progress(self._consumed, self._count)
                 except FuturesTimeoutError:
@@ -251,7 +256,12 @@ class PulseRegistration:
                     self._logger.log(self._fatal_error, level="error")
                 finally:
                     pool.shutdown(wait=not timed_out, cancel_futures=timed_out)
-                self._finish_wave_results(no_email_by_node, node_had_success)
+                self._finish_wave_results(
+                    no_email_by_node,
+                    node_had_success,
+                    browser_infra_errors,
+                    wave_size=len(futures),
+                )
             if self._fatal_error:
                 # Mailbox pool exhausted or a poisoned worker exceeded the hard
                 # wave deadline.  Returning lets task cleanup close the shared
@@ -259,6 +269,10 @@ class PulseRegistration:
                 break
             if self._done() or self._logger.is_cancel_requested():
                 break
+            if browser_infra_errors:
+                # Give a just-rebuilt Camoufox process time to settle before
+                # another synchronized burst reaches it.
+                self._stop.wait(min(2.0 * self._browser_infra_bad_waves, 10.0))
             if self._config.pulse_interval_seconds > 0:
                 time.sleep(self._config.pulse_interval_seconds)
 
@@ -278,6 +292,7 @@ class PulseRegistration:
         index: int,
         no_email_by_node: dict[str, list[int]],
         node_had_success: set[str],
+        browser_infra_errors: list[str],
     ) -> None:
         with self._state_lock:
             try:
@@ -306,17 +321,23 @@ class PulseRegistration:
                     self._requeue(index)
             else:
                 self._fail += 1
-                self._consumed += 1
                 self._first_error = self._first_error or str(result)
-                if any(
-                    marker in str(result)
-                    for marker in (
-                        "共享浏览器事件循环超过",
-                        "共享浏览器池无可用进程",
-                    )
-                ):
+                if _is_browser_runtime_fatal_failure(result):
+                    self._consumed += 1
                     self._fatal_error = f"共享浏览器池失去响应，任务终止: {result}"
                     self._logger.log(self._fatal_error, level="error")
+                elif _is_browser_infrastructure_failure(result):
+                    browser_infra_errors.append(str(result))
+                    if self._pending is None:
+                        self._consumed += 1
+                    else:
+                        # A browser-process crash is infrastructure failure,
+                        # not an exhausted account. Retry finite tasks after
+                        # the pool has rebuilt instead of silently shrinking
+                        # the requested account count.
+                        self._requeue(index)
+                else:
+                    self._consumed += 1
                 if node and "Cloudflare" in str(result):
                     if node not in self._allocator.banned_nodes():
                         self._allocator.mark_blocked(node)
@@ -329,9 +350,29 @@ class PulseRegistration:
         self,
         no_email_by_node: dict[str, list[int]],
         node_had_success: set[str],
+        browser_infra_errors: list[str],
+        *,
+        wave_size: int,
     ) -> None:
         if self._cancelled or self._fatal_error:
             return
+        crash_threshold = max((max(int(wave_size), 1) + 1) // 2, 1)
+        if len(browser_infra_errors) >= crash_threshold:
+            self._browser_infra_bad_waves += 1
+            self._logger.log(
+                "本波次共享浏览器崩溃占比过高："
+                f"{len(browser_infra_errors)}/{wave_size}，"
+                f"连续异常波次 {self._browser_infra_bad_waves}/2",
+                level="warning",
+            )
+            if self._browser_infra_bad_waves >= 2:
+                self._fatal_error = (
+                    "共享浏览器连续两个波次大面积崩溃，已触发熔断，任务终止"
+                )
+                self._logger.log(self._fatal_error, level="error")
+                return
+        else:
+            self._browser_infra_bad_waves = 0
         # Requeue every no-email index, then apply per-node ban decisions.
         for node, indexes in no_email_by_node.items():
             self._requeue_many(indexes)
