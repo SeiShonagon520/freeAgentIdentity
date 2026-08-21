@@ -123,7 +123,7 @@ def _oauth_callback_target(url: str, oauth_start: OAuthStart) -> bool:
 def _password_registration_step(page_type: str, continue_url: str = "") -> bool:
     normalized = str(page_type or "").strip().lower()
     target = str(continue_url or "").strip().lower()
-    return normalized in {"password", "create_account_password"} or "create-account/password" in target
+    return normalized in {"password", "login_password", "create_account_password"} or "create-account/password" in target or "log-in/password" in target
 
 
 def _email_otp_step(page_type: str, continue_url: str = "") -> bool:
@@ -1013,6 +1013,46 @@ class ChatGPTProtocolRegister:
         self.log(f"OpenAI signup email submitted: next={page_type}")
         return payload
 
+    def _submit_login_email(self, email: str) -> dict:
+        """Ask the auth transaction for the existing-account login method.
+
+        The HTML email-verification page is only a generic shell.  The
+        ``authorize/continue`` response carries the transaction-bound
+        ``continue_url`` for the password form; navigating to
+        ``/log-in/password`` without that state returns HTTP 400.
+        """
+        headers = self._common_headers(f"{OPENAI_AUTH}/email-verification")
+        headers["oai-device-id"] = self.device_id
+        headers.update(self.sentinel.build_headers(self.device_id, "authorize_continue"))
+        response = self.session.post(
+            OPENAI_API_ENDPOINTS["signup"],
+            json={
+                "username": {"value": email, "kind": "email"},
+                "screen_hint": "login",
+            },
+            headers=headers,
+        )
+        if _is_cloudflare_challenge_response(response):
+            raise ChatGPTCloudflareChallengeError("OpenAI login method", response)
+        payload = _response_json(response)
+        _raise_if_explicit_account_ban(payload, stage="OpenAI 登录方式选择")
+        if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
+            raise RuntimeError(
+                f"OpenAI 登录方式选择失败: {_response_error(response, payload)}"
+            )
+        page_type = _authorization_page_type(payload)
+        if page_type not in {
+            "password",
+            "login_password",
+            "email_otp_send",
+            "email_otp_verification",
+        }:
+            raise RuntimeError(
+                f"OpenAI 登录返回未知验证步骤: {page_type or 'unknown'}"
+            )
+        self.log(f"OpenAI login method selected: next={page_type}")
+        return payload
+
     def _register_password(self, email: str, password: str) -> dict:
         headers = self._common_headers(f"{OPENAI_AUTH}/create-account/password")
         headers.update(self.sentinel.build_headers(
@@ -1083,7 +1123,7 @@ class ChatGPTProtocolRegister:
             )
         )
 
-    def _load_login_password_page(self, page_response):
+    def _load_login_password_page(self, page_response, *, continue_url: str = ""):
         """Load the password page for a login transaction.
 
         OpenAI currently lands the generic login transaction on an email OTP
@@ -1095,8 +1135,9 @@ class ChatGPTProtocolRegister:
         if self._has_password_form(page_response):
             return page_response
         referer = str(getattr(page_response, "url", "") or "").strip()
+        target = str(continue_url or "/log-in/password").strip()
         response = self.session.get(
-            f"{OPENAI_AUTH}/log-in/password",
+            urljoin(OPENAI_AUTH, target),
             headers={
                 "referer": referer or f"{OPENAI_AUTH}/email-verification",
                 "user-agent": self.user_agent,
@@ -1504,7 +1545,17 @@ class ChatGPTProtocolRegister:
             login_page = self._initialize_signup(email)
             self._check_cancelled()
             if saved_totp_secret:
-                login_page = self._load_login_password_page(login_page)
+                login_authorization = self._submit_login_email(email)
+                login_continue_url = _authorization_continue_url(login_authorization)
+                login_page_type = _authorization_page_type(login_authorization)
+                if not _password_registration_step(login_page_type, login_continue_url):
+                    raise RuntimeError(
+                        "OpenAI 登录方式未提供密码步骤，拒绝改走邮箱验证码"
+                    )
+                login_page = self._load_login_password_page(
+                    login_page,
+                    continue_url=login_continue_url,
+                )
                 self.log("已进入密码登录步骤；密码提交后使用已保存的 TOTP")
             else:
                 # Compatibility path for old accounts that do not have a

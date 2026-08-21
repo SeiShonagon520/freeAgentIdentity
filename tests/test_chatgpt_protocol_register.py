@@ -982,6 +982,18 @@ def test_protocol_login_uses_password_then_saved_totp_without_reading_mailbox(mo
                     payload={"url": "https://auth.openai.com/authorize-start"},
                     url=url,
                 )
+            if url == OPENAI_API_ENDPOINTS["signup"]:
+                assert kwargs["json"] == {
+                    "username": {"value": "user@example.com", "kind": "email"},
+                    "screen_hint": "login",
+                }
+                return _FakeResponse(
+                    payload={
+                        "continue_url": "/log-in/password",
+                        "page": {"type": "login_password"},
+                    },
+                    url=url,
+                )
             if url == "https://auth.openai.com/log-in/password":
                 self.password_form = kwargs["data"]
                 return _FakeResponse(
@@ -1007,6 +1019,10 @@ def test_protocol_login_uses_password_then_saved_totp_without_reading_mailbox(mo
         session=session,
         otp_callback=lambda: mailbox_reads.append(True) or "123456",
         totp_secret="SAVEDTOTPSECRET",
+    )
+    worker.sentinel = types.SimpleNamespace(
+        build_headers=lambda *_args, **_kwargs: {},
+        close=lambda: None,
     )
 
     result = worker.login(email="user@example.com", password="StrongPass123!")
