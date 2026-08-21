@@ -1092,7 +1092,8 @@ def _login_with_registration_protocol(
     email: str,
     password: str,
     *,
-    otp_callback: Callable[[], str],
+    otp_callback: Callable[[], str] | None,
+    totp_secret: str = "",
     proxy: str | None,
     deadline: float,
     cancel_check: Callable[[], bool],
@@ -1106,6 +1107,7 @@ def _login_with_registration_protocol(
     worker = ChatGPTProtocolRegister(
         proxy=proxy,
         otp_callback=otp_callback,
+        totp_secret=totp_secret,
         log_fn=log_callback,
         cancel_check=cancel_check,
         proxy_rotate_callback=proxy_rotate_callback,
@@ -1120,6 +1122,7 @@ def login_chatgpt_with_protocol(
     password: str,
     *,
     provider_accounts: list[dict[str, Any]] | None = None,
+    totp_secret: str = "",
     proxy: str | None = None,
     timeout_seconds: float = 240,
     cancel_check: Callable[[], bool] | None = None,
@@ -1129,6 +1132,7 @@ def login_chatgpt_with_protocol(
     """Obtain fresh credentials through the direct HTTP login protocol."""
     normalized_email = str(email or "").strip()
     normalized_password = str(password or "")
+    normalized_totp_secret = str(totp_secret or "").strip()
     if not normalized_email:
         return {
             "state": "missing_mailbox",
@@ -1154,23 +1158,29 @@ def login_chatgpt_with_protocol(
                 return {"state": "cancelled", "message": "协议登录已取消", "tokens": {}}
             acquired = _PROTOCOL_LOGIN_SEMAPHORE.acquire(timeout=0.5)
         deadline = time.monotonic() + timeout_seconds
-        otp_callback = _build_protocol_login_otp_callback(
-            normalized_email,
-            provider_accounts,
-            proxy=proxy,
-            deadline=deadline,
-            cancel_check=user_cancelled,
-        )
-        if otp_callback is None:
+        otp_callback = None
+        # A TOTP-enabled account logs in with password + authenticator code.
+        # Only prepare a mailbox reader as a compatibility fallback for old
+        # records that do not have a saved secret.
+        if not normalized_totp_secret:
+            otp_callback = _build_protocol_login_otp_callback(
+                normalized_email,
+                provider_accounts,
+                proxy=proxy,
+                deadline=deadline,
+                cancel_check=user_cancelled,
+            )
+        if not normalized_totp_secret and otp_callback is None:
             return {
                 "state": "missing_mailbox",
-                "message": "账号缺少可复用的验证邮箱，无法协议登录",
+                "message": "账号既没有保存 TOTP，也缺少可复用的验证邮箱，无法协议登录",
                 "tokens": {},
             }
         result = _login_with_registration_protocol(
             normalized_email,
             normalized_password,
             otp_callback=otp_callback,
+            totp_secret=normalized_totp_secret,
             proxy=proxy,
             deadline=deadline,
             cancel_check=stopped,

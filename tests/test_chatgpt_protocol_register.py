@@ -906,6 +906,119 @@ def test_protocol_login_uses_the_post_otp_password_form_without_registering(monk
     assert session.closed is True
 
 
+def test_protocol_login_uses_password_then_saved_totp_without_reading_mailbox(monkeypatch):
+    monkeypatch.setattr(
+        "platforms.chatgpt.credential_checks.mint_chatgpt_refresh_token_from_session",
+        lambda *_args, **_kwargs: {
+            "state": "unknown",
+            "message": "not available in this login fixture",
+            "tokens": {},
+        },
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.mfa.totp_code",
+        lambda secret: "654321" if secret == "SAVEDTOTPSECRET" else "",
+    )
+
+    class TotpLoginSession:
+        def __init__(self):
+            self.cookies = _FakeCookies()
+            self.password_form = None
+            self.totp_form = None
+            self.signin_url = ""
+            self.closed = False
+
+        def get(self, url, **_kwargs):
+            if url == CHATGPT_APP:
+                return _FakeResponse(url=url)
+            if url == f"{CHATGPT_APP}/api/auth/csrf":
+                return _FakeResponse(payload={"csrfToken": "csrf-token"}, url=url)
+            if url == "https://auth.openai.com/authorize-start":
+                return _FakeResponse(
+                    status_code=302,
+                    headers={"location": "/email-verification"},
+                    url=url,
+                )
+            if url == "https://auth.openai.com/email-verification":
+                return _FakeResponse(
+                    text='<form action="/email-verification"></form>',
+                    url=url,
+                )
+            if url == "https://auth.openai.com/log-in/password":
+                return _FakeResponse(
+                    text=(
+                        '<form action="/log-in/password">'
+                        '<input type="hidden" name="state" value="password-state">'
+                        '<input type="password" name="password">'
+                        "</form>"
+                    ),
+                    url=url,
+                )
+            if url == "https://auth.openai.com/mfa":
+                return _FakeResponse(
+                    text=(
+                        '<h1>Enter the code from your authenticator app</h1>'
+                        '<form action="/mfa">'
+                        '<input type="hidden" name="state" value="mfa-state">'
+                        '<input autocomplete="one-time-code" name="totp">'
+                        "</form>"
+                    ),
+                    url=url,
+                )
+            if url == f"{CHATGPT_APP}/api/auth/session":
+                return _FakeResponse(
+                    payload={
+                        "accessToken": "header.payload.signature",
+                        "account": {"id": "account-123"},
+                    },
+                    url=url,
+                )
+            return _FakeResponse(url=url)
+
+        def post(self, url, **kwargs):
+            if url.startswith(f"{CHATGPT_APP}/api/auth/signin/openai?"):
+                self.signin_url = url
+                return _FakeResponse(
+                    payload={"url": "https://auth.openai.com/authorize-start"},
+                    url=url,
+                )
+            if url == "https://auth.openai.com/log-in/password":
+                self.password_form = kwargs["data"]
+                return _FakeResponse(
+                    status_code=302,
+                    headers={"location": "/mfa"},
+                    url=url,
+                )
+            if url == "https://auth.openai.com/mfa":
+                self.totp_form = kwargs["data"]
+                return _FakeResponse(
+                    status_code=302,
+                    headers={"location": f"{CHATGPT_APP}/"},
+                    url=url,
+                )
+            raise AssertionError(f"unexpected POST {url}")
+
+        def close(self):
+            self.closed = True
+
+    mailbox_reads = []
+    session = TotpLoginSession()
+    worker = ChatGPTProtocolRegister(
+        session=session,
+        otp_callback=lambda: mailbox_reads.append(True) or "123456",
+        totp_secret="SAVEDTOTPSECRET",
+    )
+
+    result = worker.login(email="user@example.com", password="StrongPass123!")
+
+    assert result["access_token"] == "header.payload.signature"
+    assert session.password_form == "state=password-state&password=StrongPass123%21"
+    assert session.totp_form == "state=mfa-state&totp=654321"
+    assert "screen_hint=login" in session.signin_url
+    assert mailbox_reads == []
+    assert session.closed is True
+
+
 def test_sentinel_headers_include_v8_and_session_observer_tokens(monkeypatch):
     captured = {}
 

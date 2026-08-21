@@ -81,6 +81,64 @@ def test_mihomo_rejects_offline_node(monkeypatch):
         client.validate_node("US Offline")
 
 
+def test_mihomo_healthy_candidates_skip_dead_selected_node(monkeypatch):
+    client = MihomoClient(group="REGISTER-US")
+    monkeypatch.setattr(
+        client,
+        "list_nodes",
+        lambda **_kwargs: {
+            "selected": "US Offline",
+            "nodes": [
+                {"name": "US Offline", "alive": False, "delay": None},
+                {"name": "US Slow", "alive": True, "delay": 180},
+                {"name": "US Fast", "alive": True, "delay": 24},
+            ],
+        },
+    )
+    monkeypatch.setattr(client, "is_node_enabled", lambda _node: True)
+
+    candidates = client.healthy_node_candidates()
+
+    assert [item["name"] for item in candidates] == ["US Fast", "US Slow"]
+
+
+def test_refresh_login_route_switches_from_dead_mihomo_selected_node(monkeypatch):
+    import application.tasks as tasks_module
+    from core.mihomo_client import mihomo_client
+
+    calls = []
+    logs = []
+
+    monkeypatch.setenv("MIHOMO_PROXY_URL", "http://mihomo:7890")
+    monkeypatch.setattr(
+        mihomo_client,
+        "healthy_node_candidates",
+        lambda **_kwargs: [{"name": "US Fast", "alive": True, "delay": 23}],
+    )
+    monkeypatch.setattr(
+        mihomo_client,
+        "activate_node",
+        lambda name: calls.append(("activate", name)) or "http://mihomo:7890",
+    )
+
+    def probe(proxy):
+        calls.append(("probe", proxy))
+        return (proxy == "http://mihomo:7890" and calls.count(("probe", proxy)) > 1, "HTTP 200" if calls.count(("probe", proxy)) > 1 else "ConnectionError")
+
+    monkeypatch.setattr(tasks_module, "_probe_chatgpt_login_route", probe)
+    logger = type(
+        "LoggerStub",
+        (),
+        {"log": lambda _self, message, **_kwargs: logs.append(message)},
+    )()
+
+    proxy = tasks_module._resolve_refresh_login_proxy("", logger=logger)
+
+    assert proxy == "http://mihomo:7890"
+    assert ("activate", "US Fast") in calls
+    assert any("自动切换到健康节点" in message for message in logs)
+
+
 def test_mihomo_reads_subscription_node_details_from_provider_api(monkeypatch):
     client = MihomoClient(group="REGISTER-US")
 

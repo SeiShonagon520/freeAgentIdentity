@@ -545,6 +545,39 @@ def test_refresh_check_uses_account_id_for_api_check_and_proxy_for_login(monkeyp
     assert calls["login_proxy"] == "http://127.0.0.1:17890"
 
 
+def test_refresh_check_passes_saved_totp_secret_to_protocol_login(monkeypatch):
+    from application.tasks import _run_single_refresh_token_check
+
+    account_id = _create_account(
+        email="totp-recovery@example.com",
+        extra={"access_token": "old-access", "totp_secret": "SAVEDSECRET"},
+    )
+    calls: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "platforms.chatgpt.credential_checks.check_chatgpt_access_token",
+        lambda token, **_kwargs: (
+            {"state": "invalid", "message": "HTTP 401"}
+            if token == "old-access"
+            else {"state": "valid", "message": "new token works"}
+        ),
+    )
+
+    def login(*_args, **kwargs):
+        calls.update(kwargs)
+        return {"state": "valid", "message": "recovered", "tokens": {"access_token": "new-access"}}
+
+    monkeypatch.setattr(
+        "platforms.chatgpt.credential_checks.login_chatgpt_with_protocol",
+        login,
+    )
+
+    result = _run_single_refresh_token_check(account_id)
+
+    assert result["login_succeeded"] is True
+    assert calls["totp_secret"] == "SAVEDSECRET"
+
+
 def test_refresh_check_deletes_after_relogin_reports_ban(monkeypatch):
     from application.tasks import _run_single_refresh_token_check
     from application.accounts import AccountsService

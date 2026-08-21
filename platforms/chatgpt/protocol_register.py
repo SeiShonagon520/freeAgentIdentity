@@ -561,6 +561,7 @@ class ChatGPTProtocolRegister:
         *,
         proxy: str | None = None,
         otp_callback: Callable[[], str] | None = None,
+        totp_secret: str | None = None,
         log_fn: Callable[[str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         proxy_rotate_callback: Callable[[], str | None] | None = None,
@@ -580,6 +581,10 @@ class ChatGPTProtocolRegister:
 
         self.proxy = str(proxy or "").strip() or None
         self.otp_callback = otp_callback
+        # A saved TOTP secret is used for recovery login after the password
+        # form.  Keep it on the worker so callers can pass it at construction
+        # time without ever putting the secret in logs.
+        self.totp_secret = str(totp_secret or "").strip()
         self.log = log_fn or (lambda _message: None)
         self.cancel_check = cancel_check or (lambda: False)
         self.proxy_rotate_callback = proxy_rotate_callback
@@ -794,7 +799,10 @@ class ChatGPTProtocolRegister:
                 "prompt": "login",
                 "ext-oai-did": self.device_id,
                 "auth_session_logging_id": str(uuid.uuid4()),
-                "screen_hint": "login_or_signup",
+                # Recovery is only for an existing account.  Asking for the
+                # explicit login screen prevents the generic transaction from
+                # preferring passwordless email OTP before password + MFA.
+                "screen_hint": "login",
                 "login_hint": email,
             }
         query = urlencode(query_params)
@@ -1057,7 +1065,134 @@ class ChatGPTProtocolRegister:
         _raise_if_explicit_account_ban(payload, stage="OpenAI 密码登录")
         if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
             raise RuntimeError(f"ChatGPT protocol login failed: {_response_error(response, payload)}")
-        return {"continue_url": str(response.headers.get("location") or "")}
+        return {
+            "continue_url": str(response.headers.get("location") or ""),
+            "response": response,
+            "payload": payload,
+        }
+
+    @staticmethod
+    def _has_password_form(page_response) -> bool:
+        text = str(getattr(page_response, "text", "") or "")
+        return bool(
+            re.search(r"<form\b", text, flags=re.IGNORECASE)
+            and re.search(
+                r"(?:type=[\"']password[\"']|name=[\"']password[\"'])",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    def _load_login_password_page(self, page_response):
+        """Load the password page for a login transaction.
+
+        OpenAI currently lands the generic login transaction on an email OTP
+        page even for accounts that have a password.  The password form is a
+        sibling auth step in the same transaction, so navigating to it keeps
+        the transaction/device cookies intact and avoids consuming an email
+        code before the password + TOTP path is attempted.
+        """
+        if self._has_password_form(page_response):
+            return page_response
+        referer = str(getattr(page_response, "url", "") or "").strip()
+        response = self.session.get(
+            f"{OPENAI_AUTH}/log-in/password",
+            headers={
+                "referer": referer or f"{OPENAI_AUTH}/email-verification",
+                "user-agent": self.user_agent,
+            },
+            allow_redirects=True,
+        )
+        self._check_cancelled()
+        if _is_cloudflare_challenge_response(response):
+            raise ChatGPTCloudflareChallengeError("OpenAI password login", response)
+        if getattr(response, "status_code", 0) >= 400:
+            raise RuntimeError(
+                f"OpenAI 密码登录页面获取失败: {_response_error(response)}"
+            )
+        if not self._has_password_form(response):
+            raise RuntimeError("OpenAI 登录未提供密码表单，拒绝回退到邮箱验证码")
+        return response
+
+    @staticmethod
+    def _looks_like_totp_challenge(page_response) -> bool:
+        text = str(getattr(page_response, "text", "") or "").lower()
+        url = str(getattr(page_response, "url", "") or "").lower()
+        if any(marker in url for marker in ("/mfa", "/two-factor", "/2fa", "/authenticator")):
+            return True
+        if any(
+            marker in text
+            for marker in (
+                "one-time password",
+                "two-factor",
+                "two factor",
+                "authenticator app",
+                "verification code",
+                "mfa",
+                "totp",
+            )
+        ) and re.search(r"(?:autocomplete=[\"']one-time-code|name=[\"'](?:code|otp|totp|mfa)[\"'])", text):
+            return True
+        return False
+
+    def _login_totp(self, secret: str, page_response) -> dict:
+        """Submit a saved authenticator code on the post-password MFA form."""
+        normalized_secret = str(secret or "").strip()
+        if not normalized_secret:
+            raise RuntimeError("ChatGPT protocol login requires a saved TOTP secret")
+        page_text = str(getattr(page_response, "text", "") or "")
+        action_match = re.search(
+            r"<form[^>]+action=[\"']([^\"']+)",
+            page_text,
+            flags=re.IGNORECASE,
+        )
+        if not action_match:
+            raise RuntimeError("ChatGPT protocol login MFA page did not expose a form")
+        form_action = urljoin(OPENAI_AUTH, action_match.group(1))
+        fields: dict[str, str] = {}
+        visible_names: list[str] = []
+        for tag in re.findall(r"<input[^>]*>", page_text, flags=re.IGNORECASE):
+            name_match = re.search(r"name=[\"']([^\"']+)", tag, flags=re.IGNORECASE)
+            if not name_match:
+                continue
+            name = name_match.group(1)
+            value_match = re.search(r"value=[\"']([^\"']*)", tag, flags=re.IGNORECASE)
+            value = value_match.group(1) if value_match else ""
+            if re.search(r"type=[\"']hidden[\"']", tag, flags=re.IGNORECASE):
+                fields[name] = value
+            else:
+                visible_names.append(name)
+        code_name = next(
+            (
+                name
+                for name in visible_names
+                if name.lower() in {"code", "otp", "totp", "totp_code", "mfa_code", "token"}
+            ),
+            visible_names[0] if visible_names else "code",
+        )
+        from .mfa import totp_code
+
+        fields[code_name] = totp_code(normalized_secret)
+        response = self.session.post(
+            form_action,
+            data=urlencode(fields),
+            headers={
+                "content-type": "application/x-www-form-urlencoded",
+                "origin": OPENAI_AUTH,
+                "referer": str(getattr(page_response, "url", "") or f"{OPENAI_AUTH}/mfa"),
+                "user-agent": self.user_agent,
+            },
+            allow_redirects=False,
+        )
+        payload = _response_json(response)
+        _raise_if_explicit_account_ban(payload, stage="OpenAI TOTP 登录")
+        if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
+            raise RuntimeError(f"ChatGPT TOTP 登录失败: {_response_error(response, payload)}")
+        return {
+            "continue_url": str(response.headers.get("location") or ""),
+            "response": response,
+            "payload": payload,
+        }
 
     def _create_account(self, name: str, birthdate: str) -> dict:
         """Submit the create-account request with a fresh Sentinel proof.
@@ -1352,31 +1487,60 @@ class ChatGPTProtocolRegister:
         self.log("协议注册会话内 TOTP 2FA 绑定并激活成功")
         return result
 
-    def login(self, *, email: str, password: str) -> dict:
+    def login(
+        self,
+        *,
+        email: str,
+        password: str,
+        totp_secret: str | None = None,
+    ) -> dict:
         """Log in through the same OAuth bootstrap used by registration."""
         if not str(email or "").strip() or not str(password or ""):
             raise RuntimeError("ChatGPT protocol login requires email and password")
+        saved_totp_secret = str(totp_secret or self.totp_secret or "").strip()
         self._check_cancelled()
         self.log(f"开始复用 ChatGPT 注册协议登录: {email}")
         try:
             login_page = self._initialize_signup(email)
             self._check_cancelled()
-            if not callable(self.otp_callback):
-                raise RuntimeError("ChatGPT protocol login requires an OTP callback")
-            code = str(self.otp_callback() or "").strip()
-            self._check_cancelled()
-            if not code:
-                raise RuntimeError("ChatGPT protocol login did not receive an email code")
-            validation = self._validate_otp(code)
-            self._check_cancelled()
-            continue_url = str(validation.get("continue_url") or "").strip()
-            if continue_url:
-                login_page = self._follow_authorize_chain(continue_url)
+            if saved_totp_secret:
+                login_page = self._load_login_password_page(login_page)
+                self.log("已进入密码登录步骤；密码提交后使用已保存的 TOTP")
+            else:
+                # Compatibility path for old accounts that do not have a
+                # saved TOTP secret.  Mailbox OTP is never touched when TOTP
+                # exists, so normal password+2FA accounts do not wait 180s for
+                # an email that OpenAI will not send.
+                if not callable(self.otp_callback):
+                    raise RuntimeError(
+                        "ChatGPT protocol login requires a saved TOTP secret or OTP callback"
+                    )
+                code = str(self.otp_callback() or "").strip()
+                self._check_cancelled()
+                if not code:
+                    raise RuntimeError("ChatGPT protocol login did not receive an email code")
+                validation = self._validate_otp(code)
+                self._check_cancelled()
+                continue_url = str(validation.get("continue_url") or "").strip()
+                if continue_url:
+                    login_page = self._follow_authorize_chain(continue_url)
             login_result = self._login_password(password, login_page)
             self._check_cancelled()
             continue_url = str(login_result.get("continue_url") or "").strip()
+            next_page = login_result.get("response")
             if continue_url:
-                self._follow_authorize_chain(continue_url)
+                next_page = self._follow_authorize_chain(continue_url)
+            if saved_totp_secret:
+                if not self._looks_like_totp_challenge(next_page):
+                    raise RuntimeError(
+                        "密码已提交，但 OpenAI 未进入 TOTP 验证步骤，拒绝改走邮箱验证码"
+                    )
+                totp_result = self._login_totp(saved_totp_secret, next_page)
+                self._check_cancelled()
+                continue_url = str(totp_result.get("continue_url") or "").strip()
+                if continue_url:
+                    self._follow_authorize_chain(continue_url)
+                self.log("已使用保存的 TOTP 完成双重验证")
             result = self._session_result(email, password)
             self.log("ChatGPT protocol login completed and issued a session token")
             return result

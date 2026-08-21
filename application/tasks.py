@@ -1919,6 +1919,7 @@ def _run_single_refresh_token_check(
                 account.email,
                 account.password,
                 provider_accounts=list(extra.get("provider_accounts") or []),
+                totp_secret=str(extra.get("totp_secret") or "").strip(),
                 proxy=login_proxy,
                 timeout_seconds=login_timeout,
                 cancel_check=is_cancelled,
@@ -2184,20 +2185,62 @@ def _resolve_refresh_login_proxy(
     fallback_proxy = str(os.getenv("MIHOMO_PROXY_URL") or "").strip()
     if fallback_proxy:
         fallback_detail = ""
-        # Mihomo may still be reloading its provider list when a task starts.
-        # Retry the configured proxy before considering direct access; a direct
-        # HTTP 403 is usually a Cloudflare challenge and cannot recover an AT.
-        for attempt in range(3):
-            fallback_reachable, fallback_detail = _probe_chatgpt_login_route(fallback_proxy)
+        fallback_reachable, fallback_detail = _probe_chatgpt_login_route(fallback_proxy)
+        if fallback_reachable:
+            logger.log(
+                f"协议登录/工作区线路：当前 Mihomo 节点预检通过（{fallback_detail}）；"
+                "AT 主验活直连 api.openai.com/v1/me",
+                event_type="progress",
+            )
+            return fallback_proxy
+
+        # The selector may still point at a node whose controller health is
+        # already false.  Rotate the selector through enabled healthy nodes
+        # and probe each real ChatGPT route before falling back to direct.
+        try:
+            from core.mihomo_client import mihomo_client
+
+            attempted_nodes: set[str] = set()
+            candidates = mihomo_client.healthy_node_candidates(refresh=True)
+            for candidate in candidates:
+                candidate_name = str(candidate.get("name") or "").strip()
+                if not candidate_name or candidate_name in attempted_nodes:
+                    continue
+                attempted_nodes.add(candidate_name)
+                try:
+                    candidate_proxy = mihomo_client.activate_node(candidate_name)
+                except Exception as exc:
+                    fallback_detail = f"{candidate_name}: {exc}"
+                    continue
+                candidate_reachable, candidate_detail = _probe_chatgpt_login_route(
+                    candidate_proxy
+                )
+                if candidate_reachable:
+                    logger.log(
+                        f"当前 Mihomo 节点不可用，已自动切换到健康节点："
+                        f"{candidate_name}（{candidate_detail}）；"
+                        "AT 主验活直连 api.openai.com/v1/me",
+                        level="warning",
+                        event_type="progress",
+                    )
+                    return candidate_proxy
+                fallback_detail = f"{candidate_name}: {candidate_detail}"
+        except Exception as exc:
+            fallback_detail = f"{fallback_detail or '当前节点不可达'}；健康节点选择失败: {exc}"
+
+        # Mihomo may be in the middle of a provider reload.  Give the selected
+        # route two short retries after the controller-based switch attempt.
+        for attempt in range(2):
+            time.sleep(1.0)
+            fallback_reachable, retry_detail = _probe_chatgpt_login_route(fallback_proxy)
+            fallback_detail = retry_detail or fallback_detail
             if fallback_reachable:
                 logger.log(
-                    f"协议登录/工作区线路：当前 Mihomo 节点预检通过（{fallback_detail}）；"
+                    f"协议登录/工作区线路：Mihomo 重试预检通过（{fallback_detail}）；"
                     "AT 主验活直连 api.openai.com/v1/me",
                     event_type="progress",
                 )
                 return fallback_proxy
-            if attempt < 2:
-                time.sleep(1.0)
 
     direct_reachable, direct_detail = _probe_chatgpt_login_route(None)
     if direct_reachable:
@@ -2293,6 +2336,7 @@ def _execute_refresh_token_check_task(payload: dict[str, Any], logger: TaskLogge
 
             refresh_allocator = mihomo_client.create_registration_allocator(
                 preferred_node=proxy_node or None,
+                preflight=True,
             )
             logger.log(
                 f"401 恢复登录启用独立 Mihomo slot："

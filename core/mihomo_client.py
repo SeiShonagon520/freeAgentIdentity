@@ -778,6 +778,58 @@ class MihomoClient:
             raise MihomoNodeError(f"代理节点当前不可用: {normalized}")
         return node
 
+    def healthy_node_candidates(self, *, refresh: bool = True) -> list[dict[str, Any]]:
+        """Return enabled Mihomo nodes that are not marked offline.
+
+        The selector's ``now`` value can remain pinned to a dead node after a
+        provider refresh.  Callers that use the default route must therefore
+        choose from the health table instead of blindly reusing ``now``.
+        ``alive=None`` is retained as a last-resort candidate because older
+        controllers do not report a delay until the first probe completes.
+        """
+        info = self.list_nodes(refresh=refresh)
+        nodes = [
+            item
+            for item in list(info.get("nodes") or [])
+            if isinstance(item, dict)
+            and str(item.get("name") or "").strip()
+            and item.get("alive") is not False
+            and self.is_node_enabled(str(item.get("name") or ""))
+        ]
+        selected = str(info.get("selected") or "").strip()
+        nodes.sort(
+            key=lambda item: (
+                0 if str(item.get("name") or "") == selected and item.get("alive") is True else 1,
+                0 if item.get("alive") is True else 1,
+                item.get("delay") is None,
+                int(item.get("delay") or 999999),
+                str(item.get("name") or "").lower(),
+            )
+        )
+        return nodes
+
+    def activate_healthy_node(
+        self,
+        *,
+        exclude: set[str] | None = None,
+        refresh: bool = True,
+    ) -> tuple[str, str]:
+        """Activate the best currently healthy node and return ``(name, url)``."""
+        excluded = {str(item or "").strip() for item in (exclude or set())}
+        last_error: Exception | None = None
+        for item in self.healthy_node_candidates(refresh=refresh):
+            node_name = str(item.get("name") or "").strip()
+            if not node_name or node_name in excluded:
+                continue
+            try:
+                return node_name, self.activate_node(node_name)
+            except Exception as exc:
+                last_error = exc
+                excluded.add(node_name)
+        if last_error is not None:
+            raise MihomoNodeError(f"没有可激活的健康代理节点: {last_error}") from last_error
+        raise MihomoNodeError("当前 Mihomo 节点组没有可用的健康节点")
+
     def activate_node(self, node_name: str) -> str:
         node = self.validate_node(node_name)
         group_name = quote(self.group, safe="")
