@@ -16,7 +16,7 @@ from .registry import get, load_all
 
 DAILY_401_SCHEDULE_SOURCE = "daily_401_check"
 DEFAULT_DAILY_401_HOUR = 3
-DEFAULT_DAILY_401_CONCURRENCY = 50
+DEFAULT_DAILY_401_CONCURRENCY = 100
 DEFAULT_DAILY_401_TIMEZONE = "Asia/Shanghai"
 SCHEDULER_POLL_SECONDS = 60
 TRIAL_EXPIRY_CHECK_SECONDS = 3600
@@ -179,6 +179,7 @@ class Scheduler:
             platform="chatgpt",
             concurrency=self.daily_401_concurrency,
             schedule_date=schedule_date,
+            browser=True,
         )
         self._last_daily_401_date = schedule_date
         task_runtime.wake_up()

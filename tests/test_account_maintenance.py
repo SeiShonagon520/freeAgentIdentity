@@ -113,7 +113,10 @@ def test_task_event_tail_returns_the_latest_events_in_order():
 
 
 def test_maintenance_endpoints_create_limited_background_tasks(client):
-    refresh = client.post("/api/accounts/check-refresh-tokens", json={"platform": "chatgpt", "concurrency": 5})
+    refresh = client.post(
+        "/api/accounts/check-refresh-tokens",
+        json={"platform": "chatgpt", "concurrency": 5, "browser": False},
+    )
 
     assert refresh.status_code == 200
     assert refresh.json()["type"] == "refresh_token_check"
@@ -128,6 +131,18 @@ def test_maintenance_endpoints_create_limited_background_tasks(client):
             time.sleep(0.1)
         else:
             raise AssertionError(f"task {task_id} did not finish")
+
+
+def test_refresh_check_task_defaults_to_browser_first_mode():
+    from application import tasks as tasks_module
+    from sqlmodel import Session
+    from core.db import TaskModel, engine
+
+    task = tasks_module.create_refresh_token_check_task(concurrency=1)
+    with Session(engine) as session:
+        saved = session.get(TaskModel, task["task_id"])
+        assert saved is not None
+        assert saved.get_payload()["browser"] is True
 
 
 def test_refresh_check_always_checks_access_token_even_when_rt_exists(monkeypatch):
@@ -790,7 +805,7 @@ def test_refresh_background_task_continues_after_homepage_http_403(client, monke
 
     created = client.post(
         "/api/accounts/check-refresh-tokens",
-        json={"platform": "chatgpt", "concurrency": 1},
+        json={"platform": "chatgpt", "concurrency": 1, "browser": False},
     )
     assert created.status_code == 200
     task_id = created.json()["task_id"]

@@ -16,9 +16,10 @@ class RefreshTokenCheckRequest(BaseModel):
     platform: Literal["chatgpt"] = "chatgpt"
     concurrency: int = Field(default=100, ge=1, le=200)
     proxy_node: str | None = None
-    # Browser-based verification: run the AT check through a real camoufox
-    # page (fetch) instead of the protocol client, avoiding Cloudflare 403.
-    browser: bool = False
+    # 401 maintenance is browser-first: run the AT check through Camoufox to
+    # avoid Cloudflare 403.  ``browser=false`` remains available for protocol
+    # diagnostics, but is no longer the normal maintenance path.
+    browser: bool = True
 
 
 @router.post("/check-refresh-tokens")

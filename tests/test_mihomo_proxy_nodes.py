@@ -281,7 +281,7 @@ def test_401_check_api_accepts_a_healthy_login_proxy_node(client, monkeypatch):
         "platform": "chatgpt",
         "concurrency": 3,
         "proxy_node": "US Fast",
-        "browser": False,
+        "browser": True,
     }
 
 

@@ -36,6 +36,7 @@ def test_daily_401_task_is_created_once_after_3am_and_survives_restart(monkeypat
         payload = tasks[0].get_payload()
         assert payload["platform"] == "chatgpt"
         assert payload["concurrency"] == 50
+        assert payload["browser"] is True
         assert payload["schedule_source"] == "daily_401_check"
         assert payload["schedule_date"] == "2026-07-30"
 

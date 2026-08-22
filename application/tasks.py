@@ -350,7 +350,7 @@ def create_refresh_token_check_task(
     *,
     schedule_date: str = "",
     proxy_node: str | None = None,
-    browser: bool = False,
+    browser: bool = True,
     account_ids: list[int] | None = None,
     not_before: str = "",
     schedule_source: str = "",

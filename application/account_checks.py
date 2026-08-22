@@ -10,7 +10,7 @@ class AccountChecksService:
         platform: str = "chatgpt",
         concurrency: int | None = None,
         proxy_node: str | None = None,
-        browser: bool = False,
+        browser: bool = True,
     ) -> dict:
         task = create_refresh_token_check_task(
             platform or "chatgpt",

@@ -419,7 +419,7 @@ export default function Accounts() {
       .catch(() => setMaintenanceProxyNodes([]))
   }, [])
 
-  const createRefreshCheckTask = async (browser = false) => {
+  const createRefreshCheckTask = async (browser = true) => {
     setRunningAction(browser ? 'refresh_browser' : 'refresh')
     try {
       const task = await apiFetch('/accounts/check-refresh-tokens', {
@@ -523,13 +523,9 @@ export default function Accounts() {
               <option value="150">并发 150</option>
               <option value="200">并发 200</option>
             </select>
-            <Button size="sm" variant="outline" disabled={Boolean(runningAction)} onClick={() => void createRefreshCheckTask()}>
+            <Button size="sm" variant="outline" disabled={Boolean(runningAction)} onClick={() => void createRefreshCheckTask(true)} title="先用 Camoufox 并行验活，失活账号再用协议登录恢复 AT">
               <ShieldCheck className="mr-1.5 h-4 w-4" />
-              {runningAction === 'refresh' ? '创建中…' : '401 验活'}
-            </Button>
-            <Button size="sm" variant="outline" disabled={Boolean(runningAction)} onClick={() => void createRefreshCheckTask(true)} title="用 camoufox 真实浏览器执行验活，规避 Cloudflare 403">
-              <ShieldCheck className="mr-1.5 h-4 w-4" />
-              {runningAction === 'refresh_browser' ? '创建中…' : '浏览器验活'}
+              {runningAction === 'refresh_browser' ? '创建中…' : '401 验活'}
             </Button>
             <Button size="sm" onClick={() => setShowRegister(true)}>
               <Plus className="mr-1.5 h-4 w-4" />协议注册
