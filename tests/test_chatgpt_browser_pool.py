@@ -36,6 +36,93 @@ class _FakeAsyncBrowser:
         return None
 
 
+def test_browser_fetch_pool_dispatches_requests_concurrently(monkeypatch):
+    class Response:
+        status = 200
+        headers = {"content-type": "application/json"}
+
+        async def text(self):
+            return "{}"
+
+    class Request:
+        active = 0
+        maximum = 0
+        lock = asyncio.Lock()
+
+        async def fetch(self, _url, **_kwargs):
+            async with self.lock:
+                self.active += 1
+                self.maximum = max(self.maximum, self.active)
+            await asyncio.sleep(0.03)
+            async with self.lock:
+                self.active -= 1
+            return Response()
+
+    class Context:
+        def __init__(self):
+            self.request = Request()
+            self.closed = False
+
+        async def close(self):
+            self.closed = True
+
+    class Browser:
+        def __init__(self):
+            self.context = Context()
+
+        async def new_context(self):
+            return self.context
+
+        async def close(self):
+            return None
+
+    class Manager:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.browser = Browser()
+            self.entered = 0
+            self.exited = 0
+            self.__class__.instances.append(self)
+
+        async def __aenter__(self):
+            self.entered += 1
+            return self.browser
+
+        async def __aexit__(self, *_args):
+            self.exited += 1
+
+    monkeypatch.setattr(browser_verify, "AsyncCamoufox", Manager)
+    pool = browser_verify.BrowserFetchPool(
+        headless=True,
+        proxy="http://proxy",
+        concurrency=4,
+        timeout_ms=1000,
+    )
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            results = list(
+                workers.map(
+                    lambda _: pool.browser_fetch(
+                        "https://api.openai.com/v1/me",
+                        headers={"authorization": "Bearer token"},
+                    ),
+                    range(4),
+                )
+            )
+        assert all(item["status"] == 200 for item in results)
+        assert Manager.instances[0].browser.context.request.maximum >= 2
+    finally:
+        pool.close()
+
+    assert Manager.instances[0].entered == 1
+    assert Manager.instances[0].exited == 1
+    assert Manager.instances[0].browser.context.closed is True
+
+
 def test_browser_pool_closes_the_async_camoufox_manager(monkeypatch):
     _FakeAsyncManager.instances.clear()
     monkeypatch.setattr(browser_pool, "AsyncCamoufox", _FakeAsyncManager)

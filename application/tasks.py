@@ -2410,42 +2410,95 @@ def _execute_refresh_token_check_task(payload: dict[str, Any], logger: TaskLogge
     browser_fetch = None
     _browser_session = None
     if bool(payload.get("browser")):
-        logger.log("浏览器验活已开启：使用 camoufox 页面执行 AT 校验（规避 403）", event_type="progress")
+        logger.log(
+            f"浏览器验活已开启：Camoufox 请求池并发 {concurrency}，执行 AT 校验（规避 403）",
+            event_type="progress",
+        )
         try:
-            from platforms.chatgpt.browser_verify import BrowserFetchSession
+            from platforms.chatgpt.browser_verify import BrowserFetchPool
 
-            _browser_session = BrowserFetchSession(headless=True, proxy=login_proxy or None)
+            _browser_session = BrowserFetchPool(
+                headless=True,
+                proxy=login_proxy or None,
+                concurrency=concurrency,
+            )
             _browser_session.__enter__()
             browser_fetch = _browser_session.browser_fetch
         except Exception as exc:
             logger.log(f"浏览器验活初始化失败，回退协议直连: {exc}", level="warning", event_type="progress")
             browser_fetch = None
 
-    # Browser verification shares ONE camoufox page/context which is NOT
-    # thread-safe (concurrent page/context.request calls fail with status 0).
-    # Phase 1: verify every AT serially through the browser.  Phase 2: relogin
-    # the 401/403 accounts concurrently with the protocol (curl_cffi) login,
-    # which is independent of the browser page.
+    # Phase 1: verify every AT through Camoufox with the requested concurrency.
+    # Phase 2: relogin only the accounts that are explicitly invalid/missing,
+    # concurrently with the protocol (curl_cffi) login.
+    # If browser startup failed, use the ordinary concurrent protocol path
+    # rather than accidentally falling back to a serial browser-mode loop.
+    browser_mode = browser_mode and browser_fetch is not None
     if browser_mode:
         last_progress_log = time.monotonic()
         login_ids: list[int] = []
         phase1_results = {"valid": 0, "invalid": 0, "missing": 0, "unknown": 0}
-        for completed, account_id in enumerate(account_ids, 1):
-            if logger.is_cancel_requested():
-                cancelled = True
-                break
-            try:
-                result = run_account(account_id, verify_only=True)
-                state = str(result.get("state") or "unknown")
-                phase1_results[state if state in phase1_results else "unknown"] += 1
-                if result.get("login_required"):
-                    results["login_required"] += 1
-                    login_ids.append(account_id)
-                if state == "valid":
-                    successes += 1
-            except Exception as exc:
-                phase1_results["unknown"] += 1
-                errors += 1
+        completed = 0
+        account_iter = iter(account_ids)
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            pending = {
+                pool.submit(run_account, account_id, True): account_id
+                for account_id in (
+                    next(account_iter, None)
+                    for _ in range(min(concurrency, total))
+                )
+                if account_id is not None
+            }
+            last_progress_log = time.monotonic()
+            while pending:
+                done, _ = wait(
+                    set(pending),
+                    timeout=REFRESH_TOKEN_CHECK_HEARTBEAT_SECONDS,
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in done:
+                    account_id = pending.pop(future)
+                    completed += 1
+                    try:
+                        result = future.result()
+                        state = str(result.get("state") or "unknown")
+                        phase1_results[state if state in phase1_results else "unknown"] += 1
+                        if result.get("login_required"):
+                            results["login_required"] += 1
+                            login_ids.append(account_id)
+                        if state == "valid":
+                            successes += 1
+                    except Exception:
+                        phase1_results["unknown"] += 1
+                        errors += 1
+                    next_account_id = next(account_iter, None)
+                    if next_account_id is not None and not logger.is_cancel_requested():
+                        pending[pool.submit(run_account, next_account_id, True)] = next_account_id
+                if (
+                    completed % progress_interval == 0
+                    or completed == total
+                    or (
+                        pending
+                        and time.monotonic() - last_progress_log
+                        >= REFRESH_TOKEN_CHECK_HEARTBEAT_SECONDS
+                    )
+                ):
+                    logger.set_progress(completed, total)
+                    logger.set_counts(success=successes, error=errors)
+                    logger.log(
+                        f"401 浏览器验活 {completed}/{total}：正常 {phase1_results['valid']}，"
+                        f"失效 {phase1_results['invalid']}，已删除 0，"
+                        f"未确认 {phase1_results['unknown'] + phase1_results['missing']}，"
+                        f"需登录 {results['login_required']}，处理中 {len(pending)}",
+                        event_type="progress",
+                    )
+                    last_progress_log = time.monotonic()
+                if logger.is_cancel_requested():
+                    for future in pending:
+                        future.cancel()
+                    cancelled = True
+                    break
+            results["valid"] = phase1_results["valid"]
             if completed % progress_interval == 0 or completed == total:
                 logger.set_progress(completed, total)
                 logger.set_counts(success=successes, error=errors)
@@ -2473,7 +2526,7 @@ def _execute_refresh_token_check_task(payload: dict[str, Any], logger: TaskLogge
             def _relogin(account_id: int) -> dict[str, Any]:
                 return run_account(account_id, force_recovery=True)
 
-            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            with ThreadPoolExecutor(max_workers=login_concurrency) as pool:
                 futures = [pool.submit(_relogin, aid) for aid in login_ids]
                 recovery_completed = 0
                 for future in futures:

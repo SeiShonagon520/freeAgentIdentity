@@ -943,6 +943,109 @@ def test_refresh_task_logs_heartbeat_while_tail_is_waiting(monkeypatch):
     assert logger.finished == tasks_module.TASK_STATUS_SUCCEEDED
 
 
+def test_browser_refresh_phase_uses_parallel_at_checks_then_protocol_relogin(monkeypatch):
+    import threading
+    import application.tasks as tasks_module
+
+    class BrowserPoolStub:
+        instances = []
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.closed = False
+            self.browser_fetch = lambda *_args, **_kwargs: {
+                "status": 200,
+                "text": "{}",
+                "headers": {},
+            }
+            self.__class__.instances.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed = True
+
+    monkeypatch.setattr(
+        "platforms.chatgpt.browser_verify.BrowserFetchPool",
+        BrowserPoolStub,
+    )
+    monkeypatch.setattr(tasks_module, "_account_ids_for_platform", lambda _platform: list(range(1, 9)))
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_refresh_login_proxy",
+        lambda _node, *, logger: None,
+    )
+
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
+
+    def fake_check(account_id, **kwargs):
+        nonlocal active, max_active
+        if kwargs.get("force_recovery"):
+            return {
+                "account_id": account_id,
+                "state": "valid",
+                "login_attempted": True,
+                "login_succeeded": True,
+                "recovery_state": "valid",
+            }
+        with active_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.03)
+        with active_lock:
+            active -= 1
+        if account_id % 2:
+            return {
+                "account_id": account_id,
+                "state": "invalid",
+                "login_required": True,
+            }
+        return {"account_id": account_id, "state": "valid"}
+
+    monkeypatch.setattr(tasks_module, "_run_single_refresh_token_check", fake_check)
+
+    class LoggerStub:
+        def __init__(self):
+            self.messages = []
+            self.result_data = {}
+            self.finished = ""
+
+        def log(self, message, **_kwargs):
+            self.messages.append(message)
+
+        def set_progress(self, *_args, **_kwargs):
+            pass
+
+        def set_counts(self, **_kwargs):
+            pass
+
+        def set_result_data(self, data):
+            self.result_data = data
+
+        def is_cancel_requested(self):
+            return False
+
+        def finish(self, status, **_kwargs):
+            self.finished = status
+
+    logger = LoggerStub()
+    tasks_module._execute_refresh_token_check_task(
+        {"platform": "chatgpt", "concurrency": 4, "browser": True},
+        logger,
+    )
+
+    assert BrowserPoolStub.instances[0].kwargs["concurrency"] == 4
+    assert BrowserPoolStub.instances[0].closed is True
+    assert max_active >= 2
+    assert logger.result_data["browser"] is True
+    assert logger.result_data["login_attempted"] == 4
+    assert logger.result_data["login_succeeded"] == 4
+    assert logger.finished == tasks_module.TASK_STATUS_SUCCEEDED
+
+
 def test_refresh_task_finishes_cancel_only_after_inflight_worker_stops(monkeypatch):
     import threading
 
