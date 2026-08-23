@@ -196,6 +196,10 @@ def _is_cloudflare_challenge_response(response) -> bool:
         for key, value in (getattr(response, "headers", {}) or {}).items()
     }
     content_type = headers.get("content-type", "")
+    if status in {403, 429, 500, 502, 503, 504} and (
+        headers.get("server") == "cloudflare" or "cf-ray" in headers
+    ):
+        return True
     try:
         body = str(getattr(response, "text", "") or "").lower()
     except Exception:
@@ -218,11 +222,11 @@ def _is_cloudflare_challenge_response(response) -> bool:
         )
     ):
         return True
-    # Cloudflare's current blocked page may omit its brand in the body while
-    # still exposing the CDN identity in response headers.
-    return status == 403 and (
-        headers.get("server") == "cloudflare" or "cf-ray" in headers
-    )
+    # Cloudflare's current blocked/error page may omit its brand and can be
+    # returned as an empty 5xx body from the edge.  Treat those responses as
+    # a challenge so the caller can rotate the route instead of recording a
+    # false password failure.
+    return False
 
 
 def _authorization_error_from_url(value: str) -> str:
@@ -1116,6 +1120,8 @@ class ChatGPTProtocolRegister:
             },
             allow_redirects=False,
         )
+        if _is_cloudflare_challenge_response(response):
+            raise ChatGPTCloudflareChallengeError("OpenAI password login", response)
         payload = _response_json(response)
         _raise_if_explicit_account_ban(payload, stage="OpenAI 密码登录")
         if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
@@ -1240,6 +1246,8 @@ class ChatGPTProtocolRegister:
             },
             allow_redirects=False,
         )
+        if _is_cloudflare_challenge_response(response):
+            raise ChatGPTCloudflareChallengeError("OpenAI TOTP login", response)
         payload = _response_json(response)
         _raise_if_explicit_account_ban(payload, stage="OpenAI TOTP 登录")
         if getattr(response, "status_code", 0) >= 400 or payload.get("error"):
@@ -1610,6 +1618,32 @@ class ChatGPTProtocolRegister:
             result = self._session_result(email, password)
             self.log("ChatGPT protocol login completed and issued a session token")
             return result
+        except ChatGPTCloudflareChallengeError as exc:
+            retries = int(getattr(self, "_login_cloudflare_retries", 0) or 0)
+            if (
+                self._session_factory is None
+                or not callable(self.proxy_rotate_callback)
+                or retries >= _OAUTH_INIT_MAX_ATTEMPTS - 1
+                or not self._rotate_proxy_after_challenge()
+            ):
+                raise
+            self._login_cloudflare_retries = retries + 1
+            delay = min(
+                _OAUTH_INIT_RETRY_BASE_SECONDS * (2 ** retries),
+                _OAUTH_INIT_RETRY_MAX_SECONDS,
+            )
+            self.log(
+                f"Cloudflare challenge at {exc.stage}; retrying password login "
+                f"on a new proxy in {delay:.1f}s "
+                f"({retries + 2}/{_OAUTH_INIT_MAX_ATTEMPTS})"
+            )
+            self._wait_before_oauth_retry(delay)
+            self._replace_owned_session()
+            return self.login(
+                email=email,
+                password=password,
+                totp_secret=saved_totp_secret,
+            )
         finally:
             try:
                 self.sentinel.close()

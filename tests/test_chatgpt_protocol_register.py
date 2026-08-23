@@ -682,6 +682,16 @@ def test_cloudflare_challenge_page_with_http_200_is_detected():
     assert protocol_register._is_cloudflare_challenge_response(response) is True
 
 
+def test_cloudflare_edge_http_500_without_body_is_detected():
+    response = _FakeResponse(
+        status_code=500,
+        headers={"server": "cloudflare", "cf-ray": "example-ray"},
+        url="https://auth.openai.com/log-in/password",
+    )
+
+    assert protocol_register._is_cloudflare_challenge_response(response) is True
+
+
 def test_oauth_initialization_retries_transient_tls_error_with_new_session(monkeypatch):
     class _TlsFailureSession(_FakeSession):
         def get(self, url, **kwargs):
