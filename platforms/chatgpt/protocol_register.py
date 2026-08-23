@@ -185,6 +185,15 @@ class ChatGPTCloudflareChallengeError(RuntimeError):
         )
 
 
+class ChatGPTRateLimitError(RuntimeError):
+    """The auth edge rejected a bootstrap transaction due to rate limiting."""
+
+    def __init__(self, code: str = "rate_limit_exceeded") -> None:
+        self.stage = "OpenAI OAuth rate limit"
+        self.code = str(code or "rate_limit_exceeded")
+        super().__init__(f"OpenAI OAuth initialization failed: {self.code}")
+
+
 class DirectCodexRegistrationUnavailable(RuntimeError):
     """The direct Codex registration bootstrap could not enter a signup state."""
 
@@ -731,7 +740,7 @@ class ChatGPTProtocolRegister:
         for attempt in range(1, _OAUTH_INIT_MAX_ATTEMPTS + 1):
             try:
                 return self._initialize_signup_once(email, registration=registration)
-            except ChatGPTCloudflareChallengeError as exc:
+            except (ChatGPTCloudflareChallengeError, ChatGPTRateLimitError) as exc:
                 can_retry = (
                     self._session_factory is not None
                     and callable(self.proxy_rotate_callback)
@@ -739,12 +748,24 @@ class ChatGPTProtocolRegister:
                 )
                 if not can_retry or not self._rotate_proxy_after_challenge():
                     raise
-                delay = min(
-                    _OAUTH_INIT_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
-                    _OAUTH_INIT_RETRY_MAX_SECONDS,
+                retry_base = (
+                    5.0
+                    if "rate limit" in str(exc.stage).lower()
+                    else _OAUTH_INIT_RETRY_BASE_SECONDS
+                )
+                retry_cap = (
+                    30.0
+                    if "rate limit" in str(exc.stage).lower()
+                    else _OAUTH_INIT_RETRY_MAX_SECONDS
+                )
+                delay = min(retry_base * (2 ** (attempt - 1)), retry_cap)
+                reason = (
+                    "OAuth rate limit"
+                    if "rate limit" in str(exc.stage).lower()
+                    else "Cloudflare challenge"
                 )
                 self.log(
-                    f"Cloudflare challenge at {exc.stage}; retrying OAuth "
+                    f"{reason} at {exc.stage}; retrying OAuth "
                     f"on a new proxy in {delay:.1f}s "
                     f"({attempt + 1}/{_OAUTH_INIT_MAX_ATTEMPTS})"
                 )
@@ -859,6 +880,11 @@ class ChatGPTProtocolRegister:
         final_url = str(getattr(final_response, "url", "") or "").strip()
         authorization_error = _authorization_error_from_url(final_url)
         if authorization_error:
+            if any(
+                marker in authorization_error.lower()
+                for marker in ("rate_limit", "rate limit", "too_many_requests")
+            ):
+                raise ChatGPTRateLimitError(authorization_error)
             raise RuntimeError(
                 f"OpenAI OAuth initialization failed: {authorization_error}"
             )
