@@ -285,6 +285,36 @@ def test_401_check_api_accepts_a_healthy_login_proxy_node(client, monkeypatch):
     }
 
 
+def test_401_check_api_accepts_targeted_account_ids(client, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        "api.account_checks.service.check_refresh_tokens_async",
+        lambda platform, concurrency, proxy_node=None, browser=True, account_ids=None: captured.update(
+            {
+                "platform": platform,
+                "concurrency": concurrency,
+                "proxy_node": proxy_node,
+                "browser": browser,
+                "account_ids": account_ids,
+            }
+        ) or {"task_id": "task_targeted"},
+    )
+
+    response = client.post(
+        "/api/accounts/check-refresh-tokens",
+        json={"account_ids": [3723], "concurrency": 1, "browser": False},
+    )
+
+    assert response.status_code == 200
+    assert captured == {
+        "platform": "chatgpt",
+        "concurrency": 1,
+        "proxy_node": None,
+        "browser": False,
+        "account_ids": [3723],
+    }
+
+
 def test_register_api_rejects_manual_proxy_and_node_together(client):
     response = client.post(
         "/api/tasks/register",

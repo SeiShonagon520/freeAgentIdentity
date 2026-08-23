@@ -20,6 +20,9 @@ class RefreshTokenCheckRequest(BaseModel):
     # avoid Cloudflare 403.  ``browser=false`` remains available for protocol
     # diagnostics, but is no longer the normal maintenance path.
     browser: bool = True
+    # Optional targeted checks are useful for safe retries and diagnostics;
+    # omitting this field keeps the existing all-account behavior.
+    account_ids: list[int] | None = Field(default=None, min_length=1, max_length=200)
 
 
 @router.post("/check-refresh-tokens")
@@ -32,9 +35,14 @@ def check_refresh_tokens(body: RefreshTokenCheckRequest):
             raise HTTPException(400, str(exc)) from exc
         except MihomoUnavailableError as exc:
             raise HTTPException(503, str(exc)) from exc
+    kwargs = {
+        "proxy_node": proxy_node or None,
+        "browser": body.browser,
+    }
+    if body.account_ids:
+        kwargs["account_ids"] = body.account_ids
     return service.check_refresh_tokens_async(
         body.platform,
         body.concurrency,
-        proxy_node=proxy_node or None,
-        browser=body.browser,
+        **kwargs,
     )

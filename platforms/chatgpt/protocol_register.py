@@ -155,7 +155,22 @@ def _response_error(response, payload: dict | None = None) -> str:
     if isinstance(error, str) and error:
         return error
     text = str(getattr(response, "text", "") or "").strip()
-    return text[:300] or f"HTTP {getattr(response, 'status_code', 0)}"
+    status = int(getattr(response, "status_code", 0) or 0)
+    # A number of auth form failures are returned as an empty HTTP 5xx body.
+    # Keep the diagnostic useful without ever including request data (which
+    # could contain passwords, TOTP values, cookies, or tokens).
+    if text:
+        return text[:300]
+    details: list[str] = [f"HTTP {status}"]
+    url = str(getattr(response, "url", "") or "").strip()
+    if url:
+        details.append(f"url={url[:180]}")
+    headers = getattr(response, "headers", {}) or {}
+    for name in ("x-request-id", "cf-ray", "content-type", "server"):
+        value = str(headers.get(name) or headers.get(name.title()) or "").strip()
+        if value:
+            details.append(f"{name}={value[:120]}")
+    return "; ".join(details)
 
 
 class ChatGPTCloudflareChallengeError(RuntimeError):
