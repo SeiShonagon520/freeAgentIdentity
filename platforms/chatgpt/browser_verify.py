@@ -124,6 +124,7 @@ class BrowserFetchPool:
         self._manager: Any = None
         self._browser: Any = None
         self._context: Any = None
+        self._login_semaphore: asyncio.Semaphore | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
@@ -182,6 +183,82 @@ class BrowserFetchPool:
         # loop.  No page navigation is needed for /v1/me and this avoids the
         # sync Playwright page/thread-safety limitation entirely.
         self._context = await self._browser.new_context()
+        # Login fallback is intentionally bounded much lower than AT checks:
+        # each login owns a full page/context and performs several navigations.
+        self._login_semaphore = asyncio.Semaphore(5)
+
+    async def _login_async(
+        self,
+        email: str,
+        password: str,
+        totp_secret: str,
+        log: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        browser = self._browser
+        semaphore = self._login_semaphore
+        if browser is None or semaphore is None:
+            return {"state": "invalid", "message": "browser login pool is not ready"}
+        from platforms.chatgpt.browser_register_async import register_in_context
+        from platforms.chatgpt.mfa import totp_code
+
+        async with semaphore:
+            try:
+                result = await register_in_context(
+                    browser,
+                    email=email,
+                    password=password,
+                    proxy=None,
+                    otp_callback=lambda: totp_code(totp_secret),
+                    log=log or (lambda _message: None),
+                    bind_totp_2fa=False,
+                )
+                return {
+                    "state": "valid" if str(result.get("access_token") or "").strip() else "invalid",
+                    "message": "browser login issued a fresh access token",
+                    "tokens": {
+                        key: value
+                        for key, value in {
+                            "access_token": result.get("access_token"),
+                            "refresh_token": result.get("refresh_token"),
+                            "id_token": result.get("id_token"),
+                            "session_token": result.get("session_token"),
+                            "cookies": result.get("cookies"),
+                        }.items()
+                        if value not in (None, "")
+                    },
+                }
+            except Exception as exc:
+                return {"state": "invalid", "message": str(exc)[:300], "tokens": {}}
+
+    def browser_login(
+        self,
+        email: str,
+        password: str,
+        totp_secret: str,
+        *,
+        log: Callable[[str], None] | None = None,
+        timeout_seconds: float = 120.0,
+    ) -> dict[str, Any]:
+        """Use the shared Camoufox browser for a password + TOTP login.
+
+        This is a bounded fallback for protocol logins that are blocked by an
+        auth-edge Cloudflare challenge.  It deliberately reuses the browser
+        process already opened for browser-first 401 checks.
+        """
+        loop = self._loop
+        if self._closed or loop is None or not loop.is_running():
+            return {"state": "invalid", "message": "browser login pool is closed", "tokens": {}}
+        future = asyncio.run_coroutine_threadsafe(
+            self._login_async(email, password, totp_secret, log),
+            loop,
+        )
+        try:
+            return future.result(timeout=max(float(timeout_seconds or 120.0), 10.0))
+        except FutureTimeoutError:
+            future.cancel()
+            return {"state": "invalid", "message": "browser login timeout", "tokens": {}}
+        except Exception as exc:
+            return {"state": "invalid", "message": str(exc)[:300], "tokens": {}}
 
     async def _async_close(self) -> None:
         context, browser, manager = self._context, self._browser, self._manager

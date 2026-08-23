@@ -1805,6 +1805,7 @@ def _run_single_refresh_token_check(
     login_proxy_rotate_callback: Callable[[], str | None] | None = None,
     check_proxy: str | None = None,
     browser_fetch: Callable[..., dict[str, Any]] | None = None,
+    browser_login: Callable[..., dict[str, Any]] | None = None,
     verify_only: bool = False,
     force_recovery: bool = False,
 ) -> dict[str, Any]:
@@ -1926,6 +1927,57 @@ def _run_single_refresh_token_check(
                 log_callback=event_callback,
                 proxy_rotate_callback=login_proxy_rotate_callback,
             )
+            recovery_message = str(recovery.get("message") or "")
+            recovery_lower = recovery_message.lower()
+            if (
+                callable(browser_login)
+                and any(
+                    marker in recovery_lower
+                    for marker in (
+                        "cloudflare",
+                        "rate_limit",
+                        "rate limit",
+                        "http 429",
+                        "http 500",
+                    )
+                )
+                and not is_cancelled()
+            ):
+                if event_callback:
+                    event_callback("协议登录被上游边缘拦截，切换 Camoufox 执行密码 + TOTP 登录")
+                browser_recovery = browser_login(
+                    account.email,
+                    account.password,
+                    str(extra.get("totp_secret") or "").strip(),
+                    log=event_callback,
+                )
+                browser_message = str(browser_recovery.get("message") or "")
+                browser_lower = browser_message.lower()
+                if any(
+                    marker in browser_lower
+                    for marker in (
+                        "account_deactivated",
+                        "account_suspended",
+                        "account_banned",
+                    )
+                ):
+                    recovery = {
+                        "state": "banned",
+                        "message": browser_message,
+                        "confirmed_ban_code": next(
+                            marker
+                            for marker in (
+                                "account_deactivated",
+                                "account_suspended",
+                                "account_banned",
+                            )
+                            if marker in browser_lower
+                        ),
+                        "tokens": {},
+                    }
+                elif browser_recovery.get("state") == "valid":
+                    recovery = browser_recovery
+                    recovery["message"] = browser_message or "browser login issued a fresh access token"
         recovery.setdefault("message", "401 recovery login did not issue fresh credentials")
         recovery_state = str(recovery.get("state") or "unknown")
         if recovery.get("state") == "valid":
@@ -2392,6 +2444,7 @@ def _execute_refresh_token_check_task(payload: dict[str, Any], logger: TaskLogge
                 login_proxy_rotate_callback=rotate_callback,
                 check_proxy=account_proxy,
                 browser_fetch=browser_fetch,
+                browser_login=browser_login,
                 verify_only=verify_only,
                 force_recovery=force_recovery,
                 event_callback=lambda message: logger.log(
@@ -2408,6 +2461,7 @@ def _execute_refresh_token_check_task(payload: dict[str, Any], logger: TaskLogge
     # run the /v1/me fetch inside it, so Cloudflare sees a real browser instead
     # of a protocol client (which spuriously returns HTTP 403).
     browser_fetch = None
+    browser_login = None
     _browser_session = None
     if bool(payload.get("browser")):
         logger.log(
@@ -2423,7 +2477,11 @@ def _execute_refresh_token_check_task(payload: dict[str, Any], logger: TaskLogge
                 concurrency=concurrency,
             )
             _browser_session.__enter__()
-            browser_fetch = _browser_session.browser_fetch
+            browser_fetch = getattr(_browser_session, "browser_fetch", None)
+            # Keep browser-first verification compatible with older pool
+            # implementations and test doubles that do not provide the
+            # optional password+TOTP fallback callback.
+            browser_login = getattr(_browser_session, "browser_login", None)
         except Exception as exc:
             logger.log(f"浏览器验活初始化失败，回退协议直连: {exc}", level="warning", event_type="progress")
             browser_fetch = None
