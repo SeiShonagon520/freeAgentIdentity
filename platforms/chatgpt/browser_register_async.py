@@ -326,6 +326,8 @@ async def _derive_stage_from_page(page) -> str:
     if "chatgpt.com" in host:
         if "login" in path or "signup" in path:
             return "entry"
+        if path in {"", "/"}:
+            return "complete"
 
     if "auth.openai.com" in host:
         if "about-you" in path:
@@ -440,7 +442,18 @@ async def _page_visible_text(page) -> str:
 
 async def _auth_error_text(page) -> str:
     text = await _page_visible_text(page)
-    for token in ("Incorrect", "invalid", "Invalid", "already registered", "already signed up", "已有账号"):
+    for token in (
+        "Incorrect",
+        "invalid",
+        "Invalid",
+        "account_deactivated",
+        "account_suspended",
+        "account_banned",
+        "Authentication Error",
+        "already registered",
+        "already signed up",
+        "已有账号",
+    ):
         if token in text:
             return token
     return ""

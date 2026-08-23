@@ -301,6 +301,13 @@ def _derive_stage_from_page(page) -> str:
     if "chatgpt.com" in host:
         if "login" in path or "signup" in path:
             return "entry"
+        # A successful password + MFA login currently lands on the ChatGPT
+        # home page without exposing the NextAuth cookie to Playwright's
+        # cookie list immediately.  Let the session endpoint be the source of
+        # truth; _fetch_session_via_page will verify that an access token is
+        # actually available before the flow is marked complete.
+        if path in {"", "/"}:
+            return "complete"
 
     if "auth.openai.com" in host:
         if "about-you" in path:
@@ -440,7 +447,18 @@ def _dump_debug(page, prefix: str, log) -> None:
 
 def _auth_error_text(page) -> str:
     text = _page_visible_text(page)
-    for token in ("Incorrect", "invalid", "Invalid", "already registered", "already signed up", "已有账号"):
+    for token in (
+        "Incorrect",
+        "invalid",
+        "Invalid",
+        "account_deactivated",
+        "account_suspended",
+        "account_banned",
+        "Authentication Error",
+        "already registered",
+        "already signed up",
+        "已有账号",
+    ):
         if token in text:
             return token
     return ""
