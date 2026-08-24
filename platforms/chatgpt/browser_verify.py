@@ -203,13 +203,14 @@ class BrowserFetchPool:
 
         async with semaphore:
             try:
+                log_callback = log or (lambda _message, **_kwargs: None)
                 result = await register_in_context(
                     browser,
                     email=email,
                     password=password,
                     proxy=None,
                     otp_callback=lambda: totp_code(totp_secret),
-                    log=log or (lambda _message: None),
+                    log=log_callback,
                     bind_totp_2fa=False,
                 )
                 return {
