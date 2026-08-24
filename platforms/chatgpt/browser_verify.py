@@ -203,7 +203,14 @@ class BrowserFetchPool:
 
         async with semaphore:
             try:
-                log_callback = log or (lambda _message, **_kwargs: None)
+                # Task progress callbacks accept only the message, while the
+                # browser flow also supplies structured keywords such as
+                # ``level="warning"``.  Adapt the callback here so diagnostics
+                # cannot mask the actual login result with a TypeError.
+                def log_callback(message: str, **_kwargs: Any) -> None:
+                    if log is not None:
+                        log(message)
+
                 result = await register_in_context(
                     browser,
                     email=email,

@@ -123,6 +123,33 @@ def test_browser_fetch_pool_dispatches_requests_concurrently(monkeypatch):
     assert Manager.instances[0].browser.context.closed is True
 
 
+def test_browser_login_adapts_message_only_task_logger(monkeypatch):
+    messages = []
+
+    async def fake_register(_browser, **kwargs):
+        kwargs["log"]("browser diagnostic", level="warning")
+        return {"access_token": "fresh-token"}
+
+    monkeypatch.setattr(browser_register_async, "register_in_context", fake_register)
+
+    async def run_login():
+        pool = object.__new__(browser_verify.BrowserFetchPool)
+        pool._browser = object()
+        pool._login_semaphore = asyncio.Semaphore(1)
+        return await pool._login_async(
+            "user@example.com",
+            "password",
+            "JBSWY3DPEHPK3PXP",
+            messages.append,
+        )
+
+    result = asyncio.run(run_login())
+
+    assert messages == ["browser diagnostic"]
+    assert result["state"] == "valid"
+    assert result["tokens"]["access_token"] == "fresh-token"
+
+
 def test_browser_pool_closes_the_async_camoufox_manager(monkeypatch):
     _FakeAsyncManager.instances.clear()
     monkeypatch.setattr(browser_pool, "AsyncCamoufox", _FakeAsyncManager)
