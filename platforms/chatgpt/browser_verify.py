@@ -192,6 +192,7 @@ class BrowserFetchPool:
         email: str,
         password: str,
         totp_secret: str,
+        proxy: str | None = None,
         log: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         browser = self._browser
@@ -215,7 +216,7 @@ class BrowserFetchPool:
                     browser,
                     email=email,
                     password=password,
-                    proxy=None,
+                    proxy=proxy,
                     otp_callback=lambda: totp_code(totp_secret),
                     log=log_callback,
                     bind_totp_2fa=False,
@@ -244,6 +245,7 @@ class BrowserFetchPool:
         password: str,
         totp_secret: str,
         *,
+        proxy: str | None = None,
         log: Callable[[str], None] | None = None,
         timeout_seconds: float = 120.0,
     ) -> dict[str, Any]:
@@ -257,7 +259,7 @@ class BrowserFetchPool:
         if self._closed or loop is None or not loop.is_running():
             return {"state": "invalid", "message": "browser login pool is closed", "tokens": {}}
         future = asyncio.run_coroutine_threadsafe(
-            self._login_async(email, password, totp_secret, log),
+            self._login_async(email, password, totp_secret, proxy, log),
             loop,
         )
         try:

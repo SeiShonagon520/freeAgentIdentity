@@ -127,6 +127,7 @@ def test_browser_login_adapts_message_only_task_logger(monkeypatch):
     messages = []
 
     async def fake_register(_browser, **kwargs):
+        assert kwargs["proxy"] == "http://slot-7:7907"
         kwargs["log"]("browser diagnostic", level="warning")
         return {"access_token": "fresh-token"}
 
@@ -140,6 +141,7 @@ def test_browser_login_adapts_message_only_task_logger(monkeypatch):
             "user@example.com",
             "password",
             "JBSWY3DPEHPK3PXP",
+            "http://slot-7:7907",
             messages.append,
         )
 

@@ -1949,6 +1949,7 @@ def _run_single_refresh_token_check(
                     account.email,
                     account.password,
                     str(extra.get("totp_secret") or "").strip(),
+                    proxy=login_proxy,
                     log=event_callback,
                 )
                 browser_message = str(browser_recovery.get("message") or "")
