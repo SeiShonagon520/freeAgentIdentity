@@ -17,4 +17,6 @@ def is_server_runtime() -> bool:
 
 
 def har_capture_available() -> bool:
-    return not is_server_runtime()
+    # HAR may contain cookies, one-time codes and complete request payloads;
+    # the public release does not expose capture capability.
+    return False

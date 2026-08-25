@@ -67,7 +67,7 @@ def create_register_task(body: RegisterTaskRequest):
     proxy_pool = bool(body.proxy_pool)
     proxy_api_url = str(body.proxy_api_url or "").strip() or None
     if body.har_capture and not har_capture_available():
-        raise HTTPException(400, "服务器模式不支持 camoufox HAR 抓包")
+        raise HTTPException(400, "服务器模式和公开版均不支持 HAR 抓包")
     if proxy_node and str(body.proxy or "").strip():
         raise HTTPException(400, "代理地址和 Mihomo 节点不能同时选择")
     if proxy_api_url and (proxy_node or str(body.proxy or "").strip()):

@@ -1,47 +1,49 @@
-# 参与贡献
+# 贡献指南
 
-感谢你对 aBaiAutoplus 的关注！欢迎提交 Issue 和 Pull Request。
+感谢参与。公开仓库只接受可审阅、可测试且不依赖真实账号或第三方秘密的改动。
 
 ## 开发环境
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+python -m venv .venv
+# Windows: .\\.venv\\Scripts\\Activate.ps1
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 运行测试
+前端依赖：
+
+```bash
+cd frontend
+npm ci
+```
+
+## 提交前检查
 
 ```bash
 pytest
+git diff --check
+cd frontend
+npm run build
 ```
 
-运行单个测试文件：
+如果改动涉及配置、发布流程或安全边界，请在 PR 描述中说明影响范围和回滚方式。
 
-```bash
-pytest tests/test_api_health.py -v
-```
+## 数据与安全要求
 
-## 提交规范
-
-使用 [Conventional Commits](https://www.conventionalcommits.org/)：
-
-- `feat:` 新功能
-- `fix:` 修复
-- `docs:` 文档
-- `refactor:` 重构
-- `test:` 测试
-- `chore:` 构建/工具
-
-## 添加新平台
-
-1. 在 `platforms/` 下新建目录
-2. 实现 `plugin.py`（继承 `BasePlatform`，用 `@register` 装饰器注册）
-3. 实现 `browser_register.py`（浏览器注册逻辑）
-6. 添加对应的测试
+- 只使用合成邮箱、合成 Token 和本地 mock 响应；
+- 不提交 `.env`、数据库、浏览器 profile、HAR、Cookie、OTP、截图或日志；
+- 不新增验证码求解、反自动化、代理轮换、支付流程或第三方账号批量操作代码；
+- 不把凭据写入测试、README、Issue 模板或 GitHub Actions 输出；
+- 新增外部依赖时，注明许可证、用途和是否会发送数据到第三方。
 
 ## 代码风格
 
-- Python 代码遵循 PEP 8
-- 类型注解尽量完整
-- 中文注释和日志
+- Python 遵循 PEP 8，尽量补充类型注解；
+- React/TypeScript 保持现有 ESLint 和组件风格；
+- 日志中只记录脱敏后的标识，不打印密码、Cookie、Token、邮箱验证码或完整 URL 查询参数；
+- 错误信息应帮助本地调试，但不能泄露服务端密钥或用户数据。
+
+## Issue 与 Pull Request
+
+安全问题请按照 [SECURITY.md](SECURITY.md) 私下报告，不要在公开 Issue 中粘贴利用细节或敏感数据。普通 Bug/功能建议请提供最小可复现步骤、环境信息和脱敏日志。

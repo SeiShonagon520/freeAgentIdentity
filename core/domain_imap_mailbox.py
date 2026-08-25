@@ -43,7 +43,7 @@ _ADDRESS_PATTERN = re.compile(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+", re.I
 def _normalise_domain(value: object) -> str:
     domain = str(value or "").strip().strip("@").rstrip(".").lower()
     if not _DOMAIN_PATTERN.fullmatch(domain):
-        raise ValueError("域名邮箱的域名无效，例如：abaifly.edu.kg")
+        raise ValueError("域名邮箱的域名无效，例如：example.test")
     return domain
 
 

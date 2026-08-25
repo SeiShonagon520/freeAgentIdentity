@@ -101,14 +101,14 @@ _BUILTIN_DEFINITIONS: list[dict] = [
             {
                 "key": "domain_imap_domain",
                 "label": "邮箱域名",
-                "placeholder": "abaifly.edu.kg",
+                "placeholder": "example.test",
                 "category": "connection",
                 "hint": "必须是您已控制并已配置全收（catch-all）的域名；每次注册会自动生成新的地址。",
             },
             {
                 "key": "domain_imap_host",
                 "label": "IMAP 服务器",
-                "placeholder": "mail.abaifly.edu.kg",
+                "placeholder": "mail.example.test",
                 "category": "connection",
                 "hint": "请填写与 TLS 证书匹配的主机名。若直接填 IP，SSL 证书校验通常会失败。",
             },
@@ -144,7 +144,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
                 "placeholder": "reg",
                 "default_value": "reg",
                 "category": "connection",
-                "hint": "生成示例：reg-a1b2c3d4e5f6@abaifly.edu.kg。",
+                "hint": "生成示例：reg-a1b2c3d4e5f6@example.test。",
             },
             {
                 "key": "domain_imap_poll_interval",
@@ -170,7 +170,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
             {
                 "key": "domain_imap_username",
                 "label": "IMAP 登录账号",
-                "placeholder": "catchall@abaifly.edu.kg",
+                "placeholder": "catchall@example.test",
                 "category": "auth",
             },
             {
@@ -196,7 +196,7 @@ _BUILTIN_DEFINITIONS: list[dict] = [
             {
                 "key": "inbucket_domain",
                 "label": "邮箱域名",
-                "placeholder": "abaifly.edu.kg",
+                "placeholder": "example.test",
                 "category": "connection",
                 "hint": "域名 MX 必须投递到 Inbucket 的 SMTP 服务。",
             },

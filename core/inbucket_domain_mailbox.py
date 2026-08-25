@@ -67,7 +67,7 @@ class InbucketDomainMailbox(BaseMailbox):
         self.poll_interval = _positive_number(poll_interval, 3, minimum=0, maximum=60)
         self.request_timeout = _positive_number(request_timeout, 15, minimum=1, maximum=120)
         # Optional HTTP basic auth, e.g. when the Inbucket API is fronted by
-        # nginx ``auth_basic`` (as with https://inbox.abaifly.edu.kg).
+        # nginx ``auth_basic`` can protect the local Inbucket endpoint.
         self.username = str(username or "").strip()
         self.password = str(password or "")
         self._auth = (

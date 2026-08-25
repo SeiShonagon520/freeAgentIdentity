@@ -1,54 +1,40 @@
-# 安全策略 Security Policy
+# 安全策略
 
-## 支持的版本
+## 支持范围
 
-本项目处于活跃开发阶段，安全修复仅针对最新发布版本（`main` 分支与最近一次 Release）。请在上报前确认问题在最新版本仍可复现。
+当前只维护默认分支和最新发布版本。请先用最新代码复现问题，并删除日志中的账号、Cookie、Token、邮箱地址和验证码。
 
-## 上报安全漏洞
+## 私下报告
 
-**请勿通过公开 Issue 上报安全漏洞**，以免在修复前被利用。
+请使用 GitHub 的 [Private vulnerability reporting](https://docs.github.com/code-security/security-advisories/guidance-on-reporting-and-writing/privately-reporting-a-security-vulnerability)，或通过仓库维护者在 GitHub 个人主页公布的联系方式私下报告。
 
-请通过以下方式私下上报：
+不要在公开 Issue、PR、截图或日志中提交：
 
-- 使用 GitHub 的 [Private vulnerability reporting](https://docs.github.com/code-security/security-advisories/guidance-on-reporting-and-writing/privately-reporting-a-security-vulnerability)（仓库 Security 标签页 → Report a vulnerability）
-- 或邮件联系维护者（在仓库主页查看联系方式）
+- 密码、API key、私钥、Cookie、Session、access/refresh token；
+- 邮箱池、数据库、浏览器 profile、HAR、网络抓包或一次性验证码；
+- 未脱敏的服务器地址、代理凭据、内部域名或第三方服务响应。
 
-上报时请尽量包含：
+## 运行安全基线
 
-- 受影响的组件 / 文件路径
-- 复现步骤或 PoC
-- 影响范围评估（数据泄露 / 权限绕过 / RCE 等）
-- 建议的修复方向（可选）
+- 生产环境必须设置随机 `APP_PASSWORD`；空值只适合隔离的本机开发；
+- `customer_portal_api/.env.example` 中的 JWT secret 和管理员密码只是占位符，不能直接用于生产；
+- 将 Web UI、调试端口和数据库放在受控网络，不要直接暴露到公网；
+- 使用最小权限的系统账户运行，限制 `data/` 目录权限并定期备份加密密钥；
+- 日志和导出文件设置保留期限，过期后安全删除；
+- 关闭不使用的后台任务和外部 provider。
 
-我们会在合理时间内确认收到，并在修复发布后与你协调披露时间。
+## 凭据泄露处理
 
-## 使用本项目时的安全须知
+如果凭据曾经进入 Git 历史：
 
-本项目会处理账号凭证、登录 token、第三方 API key 等敏感数据，请务必遵循以下实践。
+1. 立即在对应平台撤销或轮换凭据；
+2. 保存必要的取证信息，但不要把原始秘密再次复制到 Issue/PR；
+3. 使用 GitHub 官方建议的历史重写工具清理所有引用；
+4. 检查 fork、缓存、Release 附件和 Actions 日志；
+5. 重新扫描工作树和完整历史后再公开仓库。
 
-### 凭证与密钥
+只删除当前文件无法清除旧提交中的秘密。
 
-- **绝不提交真实凭证到版本库**。以下文件已在 `.gitignore` 中忽略，请勿强制提交：
-  - 账号导出文件：`acc*.json`、`*_accounts.txt`
-  - 数据库：`*.db`（含全部账号凭证与 token）
-  - 抓包 / 调试 dump：`*.har`、`*_inspect.txt`、`otp_*.txt`、`logger.txt`、`task_events.txt` 等
-- **所有第三方 API key 走环境变量或 Web UI 配置**，不要写死进源码。参考 [.env.example](.env.example)。
-- 怀疑任何凭证泄露时，**第一时间在对应平台后台吊销 / 重置**（接码平台 key、代理凭证、平台账号密码与会话）。
+## 公开仓库限制
 
-### 部署加固
-
-- **主服务**：公网部署务必设置 `APP_PASSWORD` 启用访问鉴权；noVNC 设置 `VNC_PASSWORD`。
-- **customer_portal_api（独立门户）**：生产环境必须
-  - 修改默认 `PORTAL_JWT_SECRET`（默认 `change-me-in-production` 不可用于生产）
-  - 修改默认管理员密码（默认 `admin123456`，首次登录后立即改密）
-  - 将 `PORTAL_CORS_ORIGINS` 从 `*` 收敛到具体可信域名
-- **端口暴露**：8000 / 6080 / 8889 仅在受信任网络开放；公网部署请置于反向代理 + TLS 之后。
-
-### 数据最小化
-
-- 定期清理不再使用的账号数据与导出文件。
-- 不要在公开渠道（Issue、PR、日志粘贴）贴出包含真实 token / cookie / 邮箱密码的内容。
-
-## 免责声明
-
-本项目仅供学习和研究使用，不得用于任何商业用途，也不得用于违反目标平台服务条款（ToS）的行为。使用本项目所产生的一切后果由使用者自行承担。
+公开仓库不包含 HAR 录制/分析材料、真实运行数据或生产凭据；代码中的可选 provider 和自动化模块仍需由使用者自行配置。任何接入都必须遵守目标平台的服务条款，不得把本项目用于绕过安全控制或批量滥用。

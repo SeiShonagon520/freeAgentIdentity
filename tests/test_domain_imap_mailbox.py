@@ -7,7 +7,7 @@ from core.domain_imap_mailbox import DomainImapCatchallMailbox
 
 def _raw_message(*, recipient: str, code: str, message_id: str) -> bytes:
     message = EmailMessage()
-    message["To"] = "Catchall <catchall@abaifly.edu.kg>"
+    message["To"] = "Catchall <catchall@example.test>"
     message["Delivered-To"] = recipient
     message["Subject"] = "Your verification code"
     message["Message-ID"] = message_id
@@ -46,9 +46,9 @@ class FakeImap:
 def _mailbox(tmp_path, messages):
     imap = FakeImap(messages)
     mailbox = DomainImapCatchallMailbox(
-        domain="abaifly.edu.kg",
-        host="mail.abaifly.edu.kg",
-        username="catchall@abaifly.edu.kg",
+        domain="example.test",
+        host="mail.example.test",
+        username="catchall@example.test",
         password="secret",
         state_file=str(tmp_path / "state.json"),
         poll_interval=0,
@@ -63,7 +63,7 @@ def test_domain_imap_allocates_unique_addresses_and_records_delivery_metadata(tm
     first = mailbox.get_email()
     second = mailbox.get_email()
 
-    assert first.email.endswith("@abaifly.edu.kg")
+    assert first.email.endswith("@example.test")
     assert first.email.startswith("reg-")
     assert first.email != second.email
     assert first.extra["provider_resource"]["metadata"]["delivery"] == "catch_all_imap"
@@ -72,7 +72,7 @@ def test_domain_imap_allocates_unique_addresses_and_records_delivery_metadata(tm
 def test_domain_imap_waits_for_code_addressed_to_the_allocated_address(tmp_path):
     mailbox, _ = _mailbox(tmp_path, {})
     account = mailbox.get_email()
-    other = "reg-other@abaifly.edu.kg"
+    other = "reg-other@example.test"
     mailbox, _ = _mailbox(
         tmp_path,
         {
@@ -89,6 +89,6 @@ def test_domain_imap_connection_test_authenticates_and_selects_inbox(tmp_path):
 
     mailbox.test_connection()
 
-    assert imap.login_args == ("catchall@abaifly.edu.kg", "secret")
+    assert imap.login_args == ("catchall@example.test", "secret")
     assert imap.selected == ("INBOX", True)
     assert imap.logged_out

@@ -1,187 +1,155 @@
 # aBaiAutoplus
 
-aBaiAutoplus 是一个以 ChatGPT free 账号注册、管理和本地配置为主的 Web 面板。当前公开前端侧栏只暴露三个顶层入口：`总览`、`chatgpt free`、`设置`。
+一个面向本地部署的账号注册、登录恢复、验活和资源池管理平台。项目提供 FastAPI 后端与 React 管理界面，把协议注册、浏览器注册、密码与 2FA、401 刷新、邮箱池和代理池串成一套可观察、可停止、可复用的任务流程。
 
-本 README 仅按当前前端可见菜单描述项目能力。代码中可能仍存在历史页面、内部路由或实验组件，但它们不属于当前公开入口。
+## 核心功能
 
-## 当前可见菜单
+### 注册方式
 
-### QQ群
+- **协议注册**：通过 HTTP 协议流程完成注册、邮箱验证码处理、密码设置和账号凭据保存。
+- **有头浏览器注册**：使用 Camoufox 浏览器执行注册流程，可在需要时通过 VNC 观察页面操作。
+- **无头浏览器注册**：使用 Camoufox headless 模式运行批量注册任务，支持并发、代理池和任务日志。
+- **密码 + 2FA**：自动注册固定设置远端密码；注册成功后绑定并激活 TOTP 2FA，密码、TOTP 密钥和账号凭据一并保存。注册或绑定失败的账号不会写入成功结果。
+- **验证码处理**：按已启用的 provider 选择远程验证码服务、本地 solver 或人工处理，并从邮箱池读取邮箱验证码。
 
-点击链接加入群聊【GPT PLUS交流群aBaiAutoplus2群】：https://qm.qq.com/q/JigtiO2Hyc
+### 401 验活与登录恢复
 
-### 总览
+- 账号列表显示 access token / refresh token 状态和 401 状态。
+- 一键创建 **401 验活任务**，先用 Camoufox 并行检查账号；失活账号再进入协议登录流程获取新的 access token。
+- 协议恢复登录使用账号已保存的邮箱、密码和 TOTP 2FA；必要时读取新的邮箱验证码。
+- 刷新成功后更新 access token、refresh token 和账号状态，失败原因写入任务日志，方便继续处理。
 
-用于查看系统和账号整体状态：
+### 邮箱池管理
 
-- 账号总数、试用、订阅、异常等统计卡片
-- 平台账号分布和状态分布
-- Cursor、Kiro、ChatGPT 等桌面环境状态
-- 手动刷新当前统计数据
+支持在设置页维护多种邮箱来源，并在注册任务中选择本次使用的邮箱服务：
 
+- **本地微软邮箱池**：导入 Outlook / Hotmail 邮箱凭据，支持 Microsoft Graph 读取验证码；默认按邮箱使用次数原子分配。
+- **API 邮箱池**：每行配置一个邮箱和对应的验证码 API，支持轮询间隔、请求超时、占用状态和是否允许复用。
+- **自有域名 IMAP 全收**：为每次注册生成独立地址，从 catch-all IMAP 收件箱读取验证码。
+- **自有域名 Inbucket**：通过 Inbucket SMTP/API 生成地址并读取验证码，适合本地开发和测试。
+- 邮箱池页面提供总量、已使用、已耗尽、预留和收件箱查询等统计；注册失败会释放邮箱租约，成功才提交使用记录。
 
-### chatgpt free
+### 代理池管理
 
-用于管理 ChatGPT free 账号：
+- 管理 Mihomo 代理订阅来源，并同步全部代理节点。
+- 查看节点延迟、存活状态、当前选中节点和 UDP 状态。
+- 支持启用/停用节点、切换当前节点、刷新订阅和测速。
+- 注册任务可选择 Mihomo 代理池、动态 IP 提取 API 或本机直连。
+- 代理池注册支持脉冲调度：按健康节点分波并发，节点异常或 IP 被封时暂停分配并定时探测恢复。
 
-- 查看 ChatGPT 账号列表、状态、邮箱和账号详情
-- 自动注册账号，支持配置注册数量、并发、注册身份和执行方式
-- 批量选择、导出和复制账号信息
-- 注册完成后可按页面配置处理工作区加入和本地结果导出
-- 查看任务日志和账号动作执行结果
+### 任务与账号管理
 
-### 设置
+- 注册、401 验活、协议恢复等任务统一进入任务中心。
+- 支持设置注册数量、并发数、邮箱 provider、代理模式和脉冲探测参数。
+- 任务日志实时展示，页面刷新后可恢复任务状态；任务可以从界面停止。
+- 账号列表支持搜索、分页、只看有 refresh token、查看 401 状态和存活率。
+- 一键复制账号、密码、TOTP 信息和 2FA 查看链接，便于后续登录或导出。
+- 启动后会显示 QQ 群二维码弹窗，可从弹窗加入交流群获取教程和更新信息。
 
-设置页的子菜单当前全部保留：
-
-| 子菜单     | 用途                                         |
-| ---------- | -------------------------------------------- |
-| 通用       | 主题、语言、默认注册策略、浏览器复用配置     |
-| 注册策略   | 默认注册身份、执行方式、OAuth 相关默认值     |
-| 邮箱服务   | 邮箱 provider 的新增、启用、默认项和参数配置 |
-| 验证服务   | 验证码 provider 和求解策略配置               |
-| 接码服务   | 接码 provider 的新增、启用、默认项和参数配置 |
-| 代理资源   | 静态代理、动态代理和代理资源管理             |
-| ChatGPT    | ChatGPT 平台相关配置                         |
-| BitBrowser | BitBrowser Profile 池管理                    |
-| 高级       | 高级配置和平台能力覆盖                       |
-| 关于       | 当前版本、更新检查、项目链接和许可信息       |
-
-## 快速开始
-
-### 环境要求
+## 运行环境
 
 - Python 3.11+
 - Node.js 18+
 - npm
+- Chromium/Camoufox 运行依赖（浏览器注册或验活时需要）
+- Mihomo（使用代理池时需要）
 
-### Windows
+## 本地运行
 
-```powershell
+```bash
 python -m venv .venv
+
+# Windows PowerShell
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
 
-cd frontend
-npm install
-npm run build
-cd ..
-
-python -m uvicorn main:app --host 0.0.0.0 --port 8000
-```
-
-启动后访问 `http://localhost:8000`。
-
-### macOS / Linux
-
-```bash
-python3 -m venv .venv
+# Linux / macOS
 source .venv/bin/activate
+
 pip install -r requirements.txt
 
 cd frontend
-npm install
+npm ci
 npm run build
 cd ..
 
-python -m uvicorn main:app --host 0.0.0.0 --port 8000
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-### 前端开发模式
+浏览器访问 <http://127.0.0.1:8000>。前端开发模式：
 
 ```bash
 cd frontend
-npm install
 npm run dev
 ```
 
-前端开发服务默认运行在 `http://localhost:5173`，后端仍需单独启动。
-
-### Docker
+## Docker
 
 ```bash
-docker compose up -d --build
+docker compose up --build
 ```
 
-默认 Web UI 端口为 `8000`。如果部署到公网，请务必设置访问密码。
+Docker Compose 会启动 API、前端静态资源和项目配置的可选依赖。浏览器、Mihomo 和邮箱服务是否启用，取决于本地配置和部署环境。
 
-Docker 会将 SQLite 数据库和微软邮箱加密密钥保存在宿主机的 `data/`
-目录。备份或迁移服务器时必须同时保留 `account_manager.db` 和
-`.microsoft_mailbox.key`；丢失密钥后，已入库的微软邮箱凭据无法解密。
+## 基本配置
 
-## 配置说明
+```bash
+cp .env.example .env
+```
 
-常用配置优先在 `设置` 页面完成；也可以按需复制 `.env.example` 为 `.env`，通过环境变量覆盖后端默认值。
+至少设置一个随机的 `APP_PASSWORD`，再在管理界面配置：
 
-公网或多人环境建议至少配置：
+1. 注册邮箱 provider 和邮箱池凭据；
+2. 验证码 provider；
+3. Mihomo 订阅或动态代理 API；
+4. 默认注册方式和执行方式；
+5. 数据库、加密密钥和任务并发参数。
+
+示例：
 
 ```env
-APP_PASSWORD=change-me
+APP_PASSWORD=<请使用密码管理器生成的随机值>
 ACCOUNT_MANAGER_DATABASE_URL=sqlite:///./data/account_manager.db
+BACKGROUND_JOBS_ENABLED=0
+APP_RUNTIME_MODE=desktop
 ```
 
-本地浏览器自动化相关能力需要安装浏览器运行时：
+更多字段和 provider 配置见 [docs/configuration.md](docs/configuration.md)。
 
-```bash
-python -m playwright install chromium
-```
-
-### 自有域名邮箱注册
-
-若使用自己控制的域名收取注册验证码，可在 `设置 → 邮箱服务` 中配置并启用“自有域名邮箱（IMAP 全收）”，然后在注册弹窗的“验证码邮箱服务”下拉框中选择它。
-
-以 `abaifly.edu.kg` 为例：
-
-- 域名填写 `abaifly.edu.kg`；IMAP 服务器应填写证书匹配的主机名（例如 `mail.abaifly.edu.kg`），不要优先使用裸 IP。
-- 邮局必须把该域名所有未创建收件人的邮件投递到一个 IMAP 收件箱（全收 / catch-all / 通配别名）。登录账号和密码填写这个收件箱的 IMAP 凭据。
-- 使用“测试连接”确认 IMAP 登录和 `INBOX` 可读取后，在注册弹窗中选择本次使用的邮箱服务。
-
-系统会为每次注册生成独立地址，例如 `reg-abcdefghijkl@abaifly.edu.kg`，并按邮件原始收件人匹配验证码，避免并发任务互相读取验证码。
-
-## 项目结构
+## 目录结构
 
 ```text
-.
-├── main.py                 # FastAPI 入口
-├── application/            # 任务、接口和应用层逻辑
-├── core/                   # 核心模型、配置和通用能力
-├── frontend/               # React + Vite 前端
-├── platforms/chatgpt/      # ChatGPT 平台适配
-├── tests/                  # 自动化测试
-├── docker-compose.yml      # Docker 启动配置
-└── requirements.txt        # Python 依赖
+api/                    FastAPI 路由：账号、任务、配置、邮箱、代理
+application/            任务编排和应用服务
+core/                   数据库、配置、凭据加密、邮箱抽象和通用逻辑
+infrastructure/         repository、provider 定义和持久化实现
+platforms/chatgpt/      协议注册、浏览器注册、验活、登录恢复和 2FA
+frontend/               React + Vite 管理界面
+tests/                  单元测试和集成测试
+docs/                   配置、发布和贡献说明
 ```
 
-## 常用验证
+## 测试与构建
 
 ```bash
-pytest
+# 后端测试
+pytest -q
 
+# 前端构建
 cd frontend
 npm run build
+cd ..
+
+# 检查补丁格式
+git diff --check
 ```
 
-针对侧栏菜单的测试位于 `tests/test_frontend_sidebar_nav.py`。
+## 社区与推广
+- 友情链接：[LINUX DO - 新的理想型社区](https://linux.do/)
 
-## 安全说明
+## 数据与凭据
 
-不要把以下内容提交到公开仓库：
+邮箱密码、refresh token、Cookie、TOTP 密钥、代理凭据和第三方 API key 请只放在本地 `.env`、数据库或 Secret 管理中，不要提交到 Git。生产环境请使用自己控制的邮箱、代理和服务配置，并定期备份数据库和加密密钥。
 
-- 真实账号、邮箱、手机号、密码、Cookie、Token、Session
-- 第三方服务 API key、代理账号、浏览器配置和本地 profile 数据
-- 本地数据库、导出文件、任务日志、短信或一次性验证码记录
-- 浏览器抓包、页面快照、调试转储和任何包含私人信息的测试材料
+## 许可证
 
-如果敏感内容已经进入 Git 历史，仅删除文件不够，需要按 GitHub 官方文档重写仓库历史并强制推送；同时应立即轮换已经暴露的密钥、账号和凭据。
-
-## 免责声明
-
-本项目仅供学习、研究和自用自动化管理场景参考。使用者需要自行确认行为符合目标平台服务条款、当地法律法规和第三方服务规则。因使用本项目产生的后果由使用者自行承担。
-
-## 许可
-
-本项目使用 AGPL-3.0 许可证。项目基于 `lxf746/any-auto-register` 的插件化注册框架二次开发，感谢原作者的开源工作。
-
-## 友情链接
-
-- [LINUX DO - 新的理想型社区](https://linux.do/)
+本项目使用 [AGPL-3.0](LICENSE)。第三方依赖仍分别受其各自许可证约束。
